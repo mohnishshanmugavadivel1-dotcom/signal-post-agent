@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import gzip
 import csv
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,12 +24,44 @@ from norway_company_agent.research import answer_profile, parse_screen_query, sc
 from norway_company_agent.workspace import load_workspace, record_screen, save_workspace  # noqa: E402
 from norway_company_agent.refresh import diff_datasets, diff_profile  # noqa: E402
 from norway_company_agent.sentiment import aggregate_company_sentiment, evaluate_predictions, publishable_sentiment_item, sentiment_input_eligibility  # noqa: E402
-from norway_company_agent.external_footprint import aggregate_footprint, publishable_observation, validate_observation  # noqa: E402
+from norway_company_agent.external_footprint import (  # noqa: E402
+    _is_organisation_number,
+    aggregate_footprint,
+    diagnostic_id,
+    is_organisation_number,
+    observation_fingerprint,
+    parse_timestamp,
+    publishable_observation,
+    validate_observation,
+)
+from norway_company_agent.external_pipeline import (  # noqa: E402
+    ObservationInputError,
+    audit_records,
+    company_external_block,
+    coverage_from_observations,
+    deduplicate_observations,
+    eligible_observations,
+    gate_observations,
+    read_observation_file,
+    run_external_summary,
+)
 from norway_company_agent.external_tasks import plan_external_tasks  # noqa: E402
 from norway_company_agent.external_control import development_score, run_company_control, strategy_order  # noqa: E402
 from norway_company_agent.identity import apply_website_identity_gate, assess_social_identity, assess_website_identity  # noqa: E402
 from norway_company_agent.website import _extraction_state, _priority_links, _social_links, assert_public_url, normalize_homepage, normalize_social_url, structured_social_links  # noqa: E402
-from norway_company_agent.batch import evidence_terminal_state, profile_complete_for_modules, read_organisation_inputs, terminal_envelope, validate_envelopes  # noqa: E402
+from norway_company_agent.batch import (  # noqa: E402
+    AVAILABILITY_STATES,
+    CONTRACT_VERSION,
+    EVIDENCE_STATUS_TO_AVAILABILITY,
+    availability_state,
+    contract_envelope,
+    evidence_terminal_state,
+    profile_complete_for_modules,
+    read_organisation_inputs,
+    terminal_envelope,
+    validate_contract_envelope,
+    validate_envelopes,
+)
 from norway_company_agent.snapshots import SnapshotFetcher  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
 from scripts.build_prototype import compact as compact_prototype, qualification_copy  # noqa: E402
@@ -38,6 +71,7 @@ from scripts.normalize_google_maps_results import candidate_score  # noqa: E402
 from scripts.run_scrapy_websites import terminal_events_for_run  # noqa: E402
 from scripts.run_sentiment_model import MODEL_REVISION, normalize_generated_label  # noqa: E402
 from scripts.score_company_completeness import score_rows, summarize  # noqa: E402
+from scripts.score_competition_v3 import capped, numeric  # noqa: E402
 from scripts.extract_company_site_activity import observation as site_activity_observation  # noqa: E402
 from scripts.extract_company_site_news import observation as site_news_observation  # noqa: E402
 from scripts.build_verified_observations import build as build_verified_observations  # noqa: E402
@@ -1329,6 +1363,1351 @@ class VerifiedSiteSeedTests(unittest.TestCase):
             failed = subprocess.run(command, capture_output=True, text=True)
             self.assertNotEqual(failed.returncode, 0)
             self.assertIn("unknown organisations", failed.stderr)
+
+
+class ObservationGateTests(unittest.TestCase):
+    """Entity, hash, duplicate, freshness and rights hardening for external observations."""
+
+    def observation(self, **changes):
+        base = {
+            "id": "obs-1",
+            "organisation_number": "923609016",
+            "platform": "google_places",
+            "signal_type": "place_summary",
+            "source_url": "https://maps.example.invalid/place/example",
+            "retrieved_at": "2026-08-20T00:00:00Z",
+            "content_sha256": "a" * 64,
+            "exact_entity": True,
+            "identity_proof": [{"type": "synthetic_identity_proof"}],
+            "acquisition_mode": "official_api",
+            "rights_status": "approved",
+            "source_class": "public_business_listing",
+        }
+        return {**base, **changes}
+
+    def test_gate_binds_observation_to_the_profile_organisation(self):
+        self.assertTrue(publishable_observation(self.observation()))
+        self.assertTrue(publishable_observation(self.observation(), organisation_number="923609016"))
+        self.assertFalse(publishable_observation(self.observation(), organisation_number="987654321"))
+        self.assertIn(
+            "observation organisation number does not match the profile",
+            validate_observation(self.observation(), organisation_number="987654321"),
+        )
+
+    def test_hash_check_is_syntax_not_truth(self):
+        self.assertTrue(publishable_observation(self.observation(content_sha256="a" * 64)))
+        for bad in ("z" * 64, "A" * 64, "a" * 63, "a" * 65, "sha256:" + "a" * 64):
+            self.assertIn("invalid content hash", validate_observation(self.observation(content_sha256=bad)))
+        self.assertIn("missing content hash", validate_observation(self.observation(content_sha256=None)))
+
+    def test_unmatched_observation_cannot_contaminate_a_profile(self):
+        outsider = self.observation(**{"id": "outsider", "organisation_number": "999999999"})
+        gate = gate_observations([outsider], organisation_numbers=["923609016", "987654321"])
+        self.assertEqual(gate["accepted"], [])
+        self.assertEqual(len(gate["unmatched"]), 1)
+        self.assertEqual(gate["unmatched"][0]["organisation_number"], "999999999")
+        self.assertEqual(gate["by_organisation"]["923609016"]["accepted_observations"], 0)
+        self.assertEqual(gate["by_organisation"]["987654321"]["accepted_observations"], 0)
+        self.assertIsNone(company_external_block(gate, "923609016"))
+        self.assertIsNone(company_external_block(gate, "999999999"))
+
+    def test_identical_duplicates_collapse_and_conflicting_duplicates_are_refused(self):
+        identical = self.observation(signal_type="review", evidence_span="Same evidence")
+        unique, report = deduplicate_observations([identical, dict(identical), dict(identical)])
+        self.assertEqual(len(unique), 1)
+        self.assertEqual(report["collapsed_identical"], 2)
+        self.assertEqual(report["conflicting_groups"], [])
+
+        conflict_a = self.observation(**{"id": "dup", "source_url": "https://maps.example.invalid/place/a"})
+        conflict_b = self.observation(**{"id": "dup", "source_url": "https://maps.example.invalid/place/b"})
+        gate = gate_observations([conflict_a, conflict_b], organisation_numbers=["923609016"])
+        self.assertEqual(gate["accepted"], [])
+        self.assertEqual(gate["duplicates"]["conflicting_groups"][0]["distinct_payloads"], 2)
+        self.assertEqual(len(gate["rejected"]), 2)
+        for entry in gate["rejected"]:
+            self.assertEqual(entry["reasons"], ["conflicting duplicate observations for the same organisation and id"])
+
+    def test_same_observation_id_across_organisations_is_not_treated_as_a_collision(self):
+        first = self.observation(**{"id": "shared", "organisation_number": "923609016", "source_url": "https://maps.example.invalid/place/a"})
+        second = self.observation(**{"id": "shared", "organisation_number": "987654321", "source_url": "https://maps.example.invalid/place/b"})
+        gate = gate_observations([first, second], organisation_numbers=["923609016", "987654321"])
+        self.assertEqual(len(gate["accepted"]), 2)
+        self.assertEqual(gate["duplicates"]["ids_shared_across_organisations"], ["shared"])
+        self.assertEqual(gate["duplicates"]["conflicting_groups"], [])
+        self.assertEqual(gate["rejected"], [])
+        self.assertEqual([item["id"] for item in gate["accepted"] if item["organisation_number"] == "923609016"], ["shared"])
+        self.assertEqual([item["id"] for item in gate["accepted"] if item["organisation_number"] == "987654321"], ["shared"])
+
+    def test_content_duplicates_with_distinct_ids_are_reported_but_kept(self):
+        first = self.observation(**{"id": "a", "source_url": "https://maps.example.invalid/place/a"})
+        second = self.observation(**{"id": "b", "source_url": "https://maps.example.invalid/place/a"})
+        gate = gate_observations([first, second], organisation_numbers=["923609016"])
+        self.assertEqual(gate["duplicates"]["content_duplicate_ids"], ["a", "b"])
+        self.assertEqual(len(gate["accepted"]), 2)
+
+    def test_rights_failure_is_reported_and_never_reaches_the_published_block(self):
+        blocked = self.observation(rights_status="review_required")
+        allowed = self.observation(**{"id": "obs-2", "source_url": "https://maps.example.invalid/place/allowed"})
+        gate = gate_observations([blocked, allowed], organisation_numbers=["923609016"])
+        self.assertEqual([item["id"] for item in gate["accepted"]], ["obs-2"])
+        self.assertEqual(gate["rejected"][0]["reasons"], ["source rights are not approved"])
+        block = company_external_block(gate, "923609016")
+        self.assertEqual(block["accepted_observation_ids"], ["obs-2"])
+        self.assertEqual(block["rejected_observations"], [{"id": "obs-1", "reasons": ["source rights are not approved"]}])
+        self.assertEqual(block["footprint"]["accepted_observations"], 1)
+
+    def test_acceptance_and_freshness_are_separate_signals(self):
+        stale = self.observation(**{"id": "stale", "signal_type": "job_posting", "retrieved_at": "2020-01-01T00:00:00Z", "evidence_span": "old"})
+        undated = self.observation(**{"id": "undated", "retrieved_at": "not-a-date", "source_url": "https://maps.example.invalid/place/undated"})
+        gate = gate_observations([stale, undated], organisation_numbers=["923609016"], as_of="2026-08-24T00:00:00Z")
+        footprint = gate["footprint"]
+        self.assertEqual(footprint["accepted_observations"], 2)   # acceptance is unchanged by age
+        self.assertEqual(footprint["fresh_observations"], 0)
+        self.assertEqual(footprint["stale_observations"], 2)
+        self.assertEqual(footprint["undated_observations"], 1)
+        self.assertEqual(footprint["counts_scope"], "accepted")
+        self.assertEqual(footprint["counted_observations"], 2)
+        self.assertFalse(footprint["freshness_policy"]["undated_is_fresh"])
+
+        enforced = gate_observations(
+            [stale, undated],
+            organisation_numbers=["923609016"],
+            as_of="2026-08-24T00:00:00Z",
+            enforce_freshness=True,
+        )["footprint"]
+        self.assertEqual(enforced["accepted_observations"], 2)
+        self.assertEqual(enforced["counted_observations"], 0)
+        self.assertEqual(enforced["active_job_count"], 0)
+        self.assertEqual(enforced["stale_observations"], 2)
+        self.assertEqual(enforced["counts_scope"], "fresh")
+
+    def test_reviewer_gate_counts_one_opinion_per_reviewer_and_host(self):
+        items = [
+            self.observation(
+                id=f"r-{index}",
+                organisation_number="923609016",
+                platform="google_places",
+                signal_type="review",
+                source_url="https://maps.example.invalid/place/example",
+                evidence_span="Great",
+                reviewer_id="same-reviewer",
+                source_class="customer_review",
+                sentiment_label="positive",
+                sentiment_model_version="fixture-v1",
+            )
+            for index in range(10)
+        ]
+        footprint = aggregate_footprint(items, as_of="2026-08-24T00:00:00Z")
+        self.assertEqual(footprint["sentiment"]["independent_reviewers"], 1)
+        self.assertEqual(footprint["sentiment"]["status"], "abstain")
+
+    def test_gate_output_is_deterministic_and_aggregation_matches_the_records(self):
+        records = [
+            self.observation(),
+            self.observation(**{"id": "obs-2", "source_url": "https://maps.example.invalid/place/2"}),
+            self.observation(**{"id": "obs-3", "organisation_number": "987654321", "source_url": "https://maps.example.invalid/place/3"}),
+            self.observation(**{"id": "obs-4", "rights_status": "unknown"}),
+        ]
+        first = gate_observations(records, organisation_numbers=["923609016", "987654321"], as_of="2026-08-24T00:00:00Z")
+        second = gate_observations(records, organisation_numbers=["923609016", "987654321"], as_of="2026-08-24T00:00:00Z")
+        self.assertEqual(json.dumps(first, sort_keys=True, default=str), json.dumps(second, sort_keys=True, default=str))
+        self.assertEqual(first["footprint"]["accepted_observations"], 3)
+        self.assertEqual(first["footprint"]["platform_counts"], {"google_places": 3})
+        self.assertEqual(
+            sum(item["accepted_observations"] for item in first["by_organisation"].values()),
+            first["footprint"]["accepted_observations"],
+        )
+        self.assertEqual(
+            len(first["accepted"]) + len(first["rejected"]) + len(first["unmatched"]),
+            first["duplicates"]["unique_records"],
+        )
+        summary = run_external_summary(first, organisation_numbers=["923609016", "987654321"])
+        self.assertEqual(summary["accepted"], first["footprint"]["accepted_observations"])
+        self.assertEqual(summary["rejection_reasons"]["source rights are not approved"], 1)
+
+    def test_malformed_jsonl_is_reported_and_never_dropped_silently(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "observations.jsonl"
+            path.write_text(
+                json.dumps(self.observation()) + "\n"
+                + "{not json}\n"
+                + '["not", "an", "object"]\n'
+                + "\n"
+                + json.dumps(self.observation(**{"id": "obs-2", "source_url": "https://maps.example.invalid/place/2"})) + "\n",
+                encoding="utf-8",
+            )
+            records, malformed = read_observation_file(path)
+            self.assertEqual(len(records), 2)
+            self.assertEqual([item["line"] for item in malformed], [2, 3])
+            self.assertIn("invalid JSON", malformed[0]["error"])
+            self.assertIn("expected object", malformed[1]["error"])
+            gate = gate_observations(records, organisation_numbers=["923609016"], malformed=malformed)
+            self.assertEqual(gate["duplicates"]["input_records"], 2)
+            self.assertEqual(len(gate["malformed"]), 2)
+            summary = run_external_summary(gate, organisation_numbers=["923609016"])
+            self.assertEqual(summary["malformed"], 2)
+
+    def test_missing_observation_file_is_an_operator_error(self):
+        with self.assertRaises(ObservationInputError):
+            read_observation_file(Path("/nonexistent/observations.jsonl"))
+
+    def test_fixture_coverage_and_connector_policy_are_measurable(self):
+        valid_path = ROOT / "tests" / "fixtures" / "external-observations-valid.jsonl"
+        records, malformed = read_observation_file(valid_path)
+        self.assertEqual(malformed, [])
+        gate = gate_observations(
+            records,
+            organisation_numbers=["923609016", "987654321", "123456789"],
+            as_of="2026-08-24T00:00:00Z",
+        )
+        summary = run_external_summary(gate, organisation_numbers=["923609016", "987654321", "123456789"])
+        self.assertEqual(summary["accepted"], 3)
+        self.assertEqual(summary["organisations_with_publishable_observation"], 2)
+        self.assertEqual(summary["fresh_coverage"], round(2 / 3, 6))
+        self.assertTrue(summary["connector_policy_passed"])
+        self.assertEqual(summary["hash_verification"]["recomputed_from_bytes"], False)
+
+
+class OutputContractTests(unittest.TestCase):
+    """The documented envelope contract is emitted and enforced at the serialization boundary."""
+
+    def profile(self, **changes):
+        profile = {
+            "organisation_number": "923609016",
+            "name": "AF GRUPPEN ASA",
+            "evidence": {
+                "registry": evidence("registry", "available", "official_registry_bulk", "https://data.brreg.no/x", value={"navn": "AF GRUPPEN ASA"}),
+                "financials": evidence("financials", "not_found", "official_registry_api", "https://data.brreg.no/y", note="No annual accounts"),
+                "website": evidence("website", "blocked", "registry_linked_company_website", "https://afgruppen.no/", note="robots.txt disallowed"),
+            },
+            "run_metrics": {"requests": 2, "runtime_ms": 12},
+        }
+        return {**profile, **changes}
+
+    def envelope(self, **changes):
+        return contract_envelope(
+            self.profile(),
+            run_id="run-1",
+            modules=["registry", "financials", "website"],
+            started_at="2026-08-24T00:00:00Z",
+            completed_at="2026-08-24T00:00:05Z",
+            **changes,
+        )
+
+    def test_envelope_carries_every_documented_field_and_validates(self):
+        envelope = self.envelope()
+        result = validate_contract_envelope(envelope)
+        self.assertTrue(result["passed"], result["errors"])
+        for key in ("contract_version", "organisation_number", "run", "claims", "evidence", "changes", "errors", "operations"):
+            self.assertIn(key, envelope)
+        self.assertEqual(envelope["contract_version"], CONTRACT_VERSION)
+        self.assertEqual(envelope["run"]["terminal_status"], "completed")
+        self.assertEqual(envelope["organisation_number"], "923609016")
+        self.assertEqual(len(envelope["claims"]), len(envelope["evidence"]))
+        self.assertEqual([claim["field"] for claim in envelope["claims"]], ["registry", "financials", "website"])
+        self.assertEqual(envelope["changes"], [])
+        self.assertEqual(envelope["operations"], {"requests": 2, "runtime_ms": 12, "third_party_cost_usd": 0.0})
+        # legacy keys stay for existing consumers
+        self.assertEqual(envelope["state"], "complete")
+        self.assertEqual(envelope["run_id"], "run-1")
+
+    def test_availability_vocabulary_is_documented_and_exhaustive(self):
+        self.assertTrue(set(EVIDENCE_STATUS_TO_AVAILABILITY.values()) <= AVAILABILITY_STATES)
+        self.assertEqual(EVIDENCE_STATUS_TO_AVAILABILITY["not_fetched"], "not_available")
+        self.assertEqual(EVIDENCE_STATUS_TO_AVAILABILITY["blocked"], "blocked")
+        self.assertEqual(EVIDENCE_STATUS_TO_AVAILABILITY["source_error"], "failed")
+        self.assertEqual(availability_state(None), "not_available")
+        envelope = self.envelope()
+        by_field = {claim["field"]: claim["availability"] for claim in envelope["claims"]}
+        self.assertEqual(by_field, {"registry": "available", "financials": "not_available", "website": "blocked"})
+        self.assertEqual(envelope["errors"][0]["module"], "website")
+        self.assertEqual(envelope["errors"][0]["state"], "blocked_robots")
+
+    def test_blocked_module_does_not_cancel_a_legitimate_empty_output(self):
+        profile = self.profile(evidence={})
+        envelope = contract_envelope(
+            profile,
+            run_id="run-empty",
+            modules=["registry", "website"],
+            started_at="2026-08-24T00:00:00Z",
+            completed_at="2026-08-24T00:00:01Z",
+        )
+        result = validate_contract_envelope(envelope)
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual({claim["availability"] for claim in envelope["claims"]}, {"not_available"})
+        self.assertEqual([record["content_sha256"] for record in envelope["evidence"]], [None, None])
+
+    def test_validation_rejects_broken_claims_counts_and_operations(self):
+        envelope = self.envelope()
+        envelope["evidence"].append({"id": "ev-dangling", "source_url": None, "source_class": None, "retrieved_at": None, "content_sha256": None, "claim_span": "x"})
+        result = validate_contract_envelope(envelope)
+        self.assertFalse(result["passed"])
+        self.assertIn("claims and evidence must contain the same number of records", result["errors"])
+
+        envelope = self.envelope()
+        envelope["claims"][0]["evidence_ids"] = ["ev-missing"]
+        self.assertIn("claim registry references unknown evidence ev-missing", validate_contract_envelope(envelope)["errors"])
+
+        envelope = self.envelope()
+        envelope["claims"][0]["confidence"] = 1.5
+        self.assertIn("claim registry has an invalid confidence", validate_contract_envelope(envelope)["errors"])
+
+        envelope = self.envelope()
+        envelope["claims"][0]["availability"] = "maybe"
+        self.assertIn("claim registry has an unsupported availability state", validate_contract_envelope(envelope)["errors"])
+
+        envelope = self.envelope()
+        envelope["operations"]["requests"] = 99
+        self.assertIn("operations.requests does not match profile.run_metrics.requests", validate_contract_envelope(envelope)["errors"])
+
+        envelope = self.envelope()
+        envelope["evidence"][0]["content_sha256"] = "not-a-hash"
+        self.assertIn("evidence ev-registry has a malformed content_sha256", validate_contract_envelope(envelope)["errors"])
+
+        envelope = self.envelope()
+        del envelope["run"]["terminal_status"]
+        self.assertIn("run is missing terminal_status", validate_contract_envelope(envelope)["errors"])
+
+    def test_validation_rejects_external_leakage_and_organisation_mismatch(self):
+        envelope = self.envelope()
+        envelope["profile"]["evidence"]["external"] = {"accepted": 1}
+        self.assertTrue(any("external data must not live inside profile.evidence" in item for item in validate_contract_envelope(envelope)["errors"]))
+
+        gate = gate_observations(
+            [{"id": "o1", "organisation_number": "987654321", "platform": "google_places", "signal_type": "place_summary",
+              "source_url": "https://maps.example.invalid/place/x", "retrieved_at": "2026-08-20T00:00:00Z",
+              "content_sha256": "a" * 64, "exact_entity": True, "identity_proof": [{"type": "proof"}],
+              "acquisition_mode": "official_api", "rights_status": "approved", "source_class": "public_business_listing"}],
+            organisation_numbers=["987654321"],
+            as_of="2026-08-24T00:00:00Z",
+        )
+        block = company_external_block(gate, "987654321")
+        self.assertEqual(block["organisation_number"], "987654321")
+        envelope = self.envelope(external_block=block)  # envelope belongs to 923609016
+        self.assertIn("external block organisation_number does not match the envelope", validate_contract_envelope(envelope)["errors"])
+
+        envelope = self.envelope(external_block={**block, "publishable_only": False})
+        self.assertIn("external block must be publishable-only", validate_contract_envelope(envelope)["errors"])
+
+        envelope = self.envelope(external_block={**block, "accepted_observation_ids": [], "rejected_observations": [{"id": "x", "reasons": [], "value": "leak"}]})
+        self.assertIn("rejected observations may only carry id and reasons", validate_contract_envelope(envelope)["errors"])
+
+    def test_external_evidence_stays_out_of_official_claims_and_evidence(self):
+        gate = gate_observations(
+            [{"id": "o1", "organisation_number": "923609016", "platform": "google_places", "signal_type": "place_summary",
+              "source_url": "https://maps.example.invalid/place/x", "retrieved_at": "2026-08-20T00:00:00Z",
+              "content_sha256": "a" * 64, "exact_entity": True, "identity_proof": [{"type": "proof"}],
+              "acquisition_mode": "official_api", "rights_status": "approved", "source_class": "public_business_listing"}],
+            organisation_numbers=["923609016"],
+            as_of="2026-08-24T00:00:00Z",
+        )
+        envelope = self.envelope(external_block=company_external_block(gate, "923609016"))
+        self.assertTrue(validate_contract_envelope(envelope)["passed"], validate_contract_envelope(envelope)["errors"])
+        self.assertNotIn("external", envelope["profile"]["evidence"])
+        self.assertEqual(envelope["external"]["accepted_observation_ids"], ["o1"])
+        self.assertEqual([claim["field"] for claim in envelope["claims"]], ["registry", "financials", "website"])
+        self.assertEqual(
+            {record["source_class"] for record in envelope["evidence"]},
+            {"official_registry_bulk", "official_registry_api", "registry_linked_company_website"},
+        )
+        self.assertNotIn("maps.example.invalid", json.dumps(envelope["evidence"]))
+
+    def test_terminal_envelope_wrapper_keeps_legacy_behaviour(self):
+        envelope = terminal_envelope(
+            self.profile(),
+            run_id="run-legacy",
+            modules=["registry"],
+            started_at="2026-08-24T00:00:00Z",
+            completed_at="2026-08-24T00:00:01Z",
+        )
+        self.assertEqual(envelope["state"], "complete")
+        self.assertEqual(envelope["modules"]["registry"]["state"], "complete")
+        self.assertIn("claims", envelope)
+        self.assertTrue(validate_contract_envelope(envelope)["passed"])
+
+
+class RemediationRegressionTests(unittest.TestCase):
+    """Regressions for the four priority findings fixed in the 2026-10-02 remediation sprint.
+
+    Every test names the finding it guards and asserts behaviour that was wrong before the fix
+    (or that the fix introduced); the F1 test reruns the original two-invocation reproduction.
+    """
+
+    FIXTURES = ROOT / "tests" / "fixtures"
+
+    def observation(self, **changes):
+        base = {
+            "id": "obs-1",
+            "organisation_number": "923609016",
+            "platform": "google_places",
+            "signal_type": "place_summary",
+            "source_url": "https://maps.example.invalid/place/example",
+            "retrieved_at": "2026-08-20T00:00:00Z",
+            "content_sha256": "a" * 64,
+            "exact_entity": True,
+            "identity_proof": [{"type": "synthetic_identity_proof"}],
+            "acquisition_mode": "official_api",
+            "rights_status": "approved",
+            "source_class": "public_business_listing",
+        }
+        return {**base, **changes}
+
+    def batch_run(self, workdir, label, extra):
+        command = [
+            sys.executable, str(ROOT / "scripts" / "run_competition_batch.py"),
+            "--organisations", str(self.FIXTURES / "batch-orgs-3.jsonl"),
+            "--bulk", str(self.FIXTURES / "bulk-registry-sample.csv.gz"),
+            "--profiles-output", str(workdir / "profiles.jsonl"),
+            "--output", str(workdir / f"envelopes-{label}.jsonl"),
+            "--report", str(workdir / f"report-{label}.json"),
+            "--run-id", f"regression-{label}",
+            "--expected-count", "3",
+            "--modules", "registry,accounting_obligation,website",
+            "--external-as-of", "2026-08-24T00:00:00Z",
+        ] + extra
+        completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=180)
+        envelopes_path = workdir / f"envelopes-{label}.jsonl"
+        report_path = workdir / f"report-{label}.json"
+        envelopes = [
+            json.loads(line) for line in envelopes_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ] if envelopes_path.exists() else []
+        report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+        return completed, envelopes, report
+
+    # ------------------------------------------------------------------ F1
+    def test_f1_resume_never_republishes_stale_external_evidence(self):
+        """Original defect: a resumed run with no observations reused a stored external block."""
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            valid = str(self.FIXTURES / "external-observations-valid.jsonl")
+
+            first, first_envelopes, first_report = self.batch_run(workdir, "first", ["--external-observations", valid])
+            self.assertEqual(first.returncode, 0, first.stderr[-400:])
+            self.assertEqual(first_report["contract_status"]["external_block_present"], 2)
+            self.assertTrue(any("external_footprint" in envelope.get("profile", {}) for envelope in first_envelopes))
+
+            second, second_envelopes, second_report = self.batch_run(workdir, "second", ["--resume"])
+            self.assertEqual(second.returncode, 0, second.stderr[-400:])
+            self.assertNotIn("external", second_report)
+            self.assertEqual(second_report["contract_status"]["external_block_present"], 0)
+            self.assertEqual(second_report["resume"]["profiles_reused"], 3)
+            self.assertEqual(second_report["resume"]["stale_external_blocks_discarded"], 2)
+            self.assertIn("never reused", second_report["resume"]["policy"])
+            for envelope in second_envelopes:
+                self.assertNotIn("external", envelope)
+                self.assertNotIn("external_footprint", envelope["profile"])
+
+            third, third_envelopes, third_report = self.batch_run(workdir, "third", ["--resume", "--external-observations", valid])
+            self.assertEqual(third.returncode, 0, third.stderr[-400:])
+            rebuilt = sorted(
+                observation_id for envelope in third_envelopes
+                for observation_id in (envelope.get("external") or {}).get("accepted_observation_ids", [])
+            )
+            self.assertIn("places-summary-923609016", rebuilt)
+            self.assertEqual(third_report["contract_status"]["external_block_present"], 2)
+
+    def test_f1_contract_validator_refuses_a_stored_block_without_a_matching_external_block(self):
+        profile = {
+            "organisation_number": "923609016",
+            "name": "AF GRUPPEN ASA",
+            "evidence": {"registry": evidence("registry", "available", "official_registry_bulk", "https://data.brreg.no/x", value={})},
+            "run_metrics": {"requests": 1, "runtime_ms": 1},
+            "external_footprint": {"organisation_number": "923609016", "accepted_observation_ids": ["o1"]},
+        }
+        envelope = contract_envelope(
+            profile, run_id="run-stale", modules=["registry"],
+            started_at="2026-08-24T00:00:00Z", completed_at="2026-08-24T00:00:01Z",
+        )
+        result = validate_contract_envelope(envelope)
+        self.assertFalse(result["passed"])
+        self.assertIn("profile.external_footprint is present but the envelope has no external block", result["errors"])
+
+        inside = contract_envelope(
+            profile, run_id="run-inside", modules=["registry"],
+            started_at="2026-08-24T00:00:00Z", completed_at="2026-08-24T00:00:01Z",
+            external_block={"organisation_number": "923609016", "publishable_only": True,
+                            "accepted_observation_ids": ["o2"], "rejected_observations": []},
+        )
+        result = validate_contract_envelope(inside)
+        self.assertFalse(result["passed"])
+        self.assertIn("profile.external_footprint does not match the envelope external block", result["errors"])
+
+    # ------------------------------------------------------------------ F2
+    def test_f2_malformed_metrics_are_rejected_with_specific_reasons(self):
+        cases = (
+            ("not-a-dict", "metrics must be an object"),
+            ([1, 2], "metrics must be an object"),
+            ({"likes": "many"}, "metric likes must be a non-negative number"),
+            ({"likes": [1]}, "metric likes must be a non-negative number"),
+            ({"likes": {"value": 1}}, "metric likes must be a non-negative number"),
+            ({"likes": True}, "metric likes must be a non-negative number"),
+            ({"likes": -1}, "metric likes must be a non-negative number"),
+            ({"likes": float("nan")}, "metric likes must be a non-negative number"),
+        )
+        for value, expected in cases:
+            with self.subTest(metrics=value):
+                self.assertIn(expected, validate_observation(self.observation(metrics=value)))
+        self.assertEqual(validate_observation(self.observation(metrics={"likes": 4.5, "comments": 0})), [])
+        self.assertEqual(validate_observation(self.observation(metrics=None)), [])
+
+    def test_f2_unhashable_values_are_rejected_instead_of_raising(self):
+        cases = {
+            "platform": ["google_places"],
+            "signal_type": {"type": "place_summary"},
+            "acquisition_mode": ["official_api"],
+            "sentiment_label": ["positive"],
+            "source_class": {"name": "public_news"},
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                item = self.observation(signal_type="review", evidence_span="span", sentiment_label="positive",
+                                        source_class="public_news", sentiment_model_version="model-1")
+                item[field] = value
+                reasons = validate_observation(item)
+                self.assertTrue(reasons)
+                gate = gate_observations([item], organisation_numbers=["923609016"])
+                self.assertEqual(gate["accepted"], [])
+                self.assertEqual(len(gate["rejected"]), 1)
+
+    def test_f2_one_malformed_record_does_not_abort_the_batch(self):
+        malformed = self.observation(id="bad", signal_type="public_post", metrics="not-a-dict")
+        gate = gate_observations([malformed, self.observation()], organisation_numbers=["923609016"])
+        self.assertEqual([item["id"] for item in gate["accepted"]], ["obs-1"])
+        self.assertEqual(len(gate["rejected"]), 1)
+        self.assertIn("metrics must be an object", gate["rejected"][0]["reasons"])
+
+    def test_f2_identity_proof_and_evidence_span_are_typed(self):
+        self.assertIn("missing exact-entity proof", validate_observation(self.observation(identity_proof={"type": "x"})))
+        self.assertIn("identity proof entries must be objects", validate_observation(self.observation(identity_proof=["x"])))
+        self.assertIn("missing evidence span", validate_observation(self.observation(signal_type="public_post", evidence_span=7)))
+        self.assertIn("missing evidence span", validate_observation(self.observation(signal_type="public_post", evidence_span="  ")))
+
+    def test_f2_invalid_timestamps_are_typed_or_counted_stale(self):
+        self.assertIn("retrieval time must be a string", validate_observation(self.observation(retrieved_at=20260820)))
+        undated = self.observation(**{"id": "undated", "retrieved_at": "not-a-date"})
+        self.assertEqual(validate_observation(undated), [])
+        gate = gate_observations([undated], organisation_numbers=["923609016"], as_of="2026-08-24T00:00:00Z")
+        block = company_external_block(gate, "923609016")
+        self.assertEqual(len(gate["accepted"]), 1)
+        self.assertEqual(block["stale_observation_ids"], ["undated"])
+        self.assertEqual(block["footprint"]["fresh_observations"], 0)
+
+    def test_f2_malformed_org_numbers_are_data_errors_not_unmatched(self):
+        malformed = self.observation(**{"id": "short-org", "organisation_number": "12345678"})
+        coerced = self.observation(**{"id": "int-org", "organisation_number": 923609016})
+        outsider = self.observation(**{"id": "unlisted", "organisation_number": "999999999"})
+        gate = gate_observations([malformed, coerced, outsider], organisation_numbers=["923609016"])
+        rejected = {entry["id"]: entry["reasons"] for entry in gate["rejected"]}
+        self.assertIn("missing or invalid organisation number", rejected["short-org"])
+        self.assertIn("missing or invalid organisation number", rejected["int-org"])
+        self.assertEqual([entry["id"] for entry in gate["unmatched"]], ["unlisted"])
+
+    # ------------------------------------------------------------------ F3
+    def test_f3_audit_labels_are_bound_to_the_composite_identity(self):
+        records = [
+            self.observation(**{"id": "shared", "organisation_number": "923609016", "source_url": "https://maps.example.invalid/place/a"}),
+            self.observation(**{"id": "shared", "organisation_number": "987654321", "source_url": "https://maps.example.invalid/place/b"}),
+        ]
+        labels = [{"organisation_number": "923609016", "id": "shared", "exact_entity": True, "metric_correct": True}]
+        audit = audit_records(records, labels, organisation_numbers=["923609016", "987654321"])
+        self.assertEqual(audit["published_audited"], 1)
+        self.assertEqual(audit["labels_without_observation"], [])
+        self.assertEqual(audit["observations_without_labels"], [["987654321", "shared"]])
+        self.assertEqual(audit["coverage_by_organisation"]["987654321"]["published_audited"], 0)
+
+    def test_f3_duplicate_labels_collapse_and_conflicting_labels_are_withheld(self):
+        base = {"organisation_number": "923609016", "id": "obs-1", "exact_entity": True, "metric_correct": True}
+        duplicate = audit_records([self.observation()], [base, dict(base)], organisation_numbers=["923609016"])
+        self.assertEqual(duplicate["published_audited"], 1)
+        self.assertEqual([entry["position"] for entry in duplicate["labels_duplicate"]], [2])
+        self.assertEqual(duplicate["labels_conflicting"], [])
+
+        conflict = audit_records([self.observation()], [base, {**base, "exact_entity": False}], organisation_numbers=["923609016"])
+        self.assertEqual(len(conflict["labels_conflicting"]), 1)
+        self.assertEqual(conflict["labels_usable"], 0)
+        self.assertEqual(conflict["published_audited"], 0)
+        self.assertFalse(conflict["qualification_passed"])
+
+    def test_f3_diagnostics_cover_unmatched_and_unlabelled(self):
+        labels = [
+            {"organisation_number": "923609016", "id": "ghost", "exact_entity": True, "metric_correct": True},
+            {"id": "no-org", "exact_entity": True},
+        ]
+        audit = audit_records([self.observation()], labels, organisation_numbers=["923609016"])
+        self.assertEqual(audit["labels_without_observation"], [["923609016", "ghost"]])
+        self.assertEqual(audit["observations_without_labels"], [["923609016", "obs-1"]])
+        self.assertEqual(len(audit["labels_invalid"]), 1)
+        self.assertEqual(audit["labels_invalid"][0]["reason"], "label needs a string organisation_number and id")
+
+    # ------------------------------------------------------------------ F4
+    def test_f4_scorer_cannot_close_the_audit_gate_with_fabricated_report_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            profiles = workdir / "profiles.jsonl"
+            profiles.write_text(
+                "\n".join(json.dumps({"organisation_number": org}) for org in ("923609016", "987654321", "123456789")) + "\n",
+                encoding="utf-8",
+            )
+            fabricated = {
+                "qualification_passed": True,
+                "audit_size_gate": True,
+                "published_audited": 500,
+                "wrong_entity_publications": 0,
+                "unsupported_publications": 0,
+                "fresh_coverage": 1.0,
+                "connector_policy_passed": True,
+                "coverage": {key: 1.0 for key in (
+                    "any_external", "two_platforms", "workforce_jobs", "ratings_reviews", "buzz_engagement", "sentiment")},
+            }
+            external = workdir / "external.json"
+            external.write_text(json.dumps(fabricated), encoding="utf-8")
+            for name in ("batch", "refresh", "research", "ux"):
+                (workdir / f"{name}.json").write_text("{}", encoding="utf-8")
+            output = workdir / "score.json"
+            command = [
+                sys.executable, str(ROOT / "scripts" / "score_competition_v3.py"),
+                "--profiles", str(profiles),
+                "--external-report", str(external),
+                "--batch-report", str(workdir / "batch.json"),
+                "--refresh-report", str(workdir / "refresh.json"),
+                "--research-report", str(workdir / "research.json"),
+                "--ux-report", str(workdir / "ux.json"),
+                "--output", str(output),
+            ]
+            untrusted = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=120)
+            self.assertEqual(untrusted.returncode, 0, untrusted.stderr[-400:])
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["measurement_source"], "unverified_report")
+            self.assertFalse(report["measurement_trust"]["report_values_explicitly_trusted"])
+            # Every external gate must stay unproven in report-only mode: a future edit that made
+            # report trust implicit (or trusted the counts while leaving the audit gate alone)
+            # would turn one of these true and this test would fail.
+            for gate in (
+                "external_audit_at_least_100",
+                "zero_wrong_company_external_publications",
+                "external_claims_supported",
+                "external_connector_policy",
+            ):
+                with self.subTest(gate=gate):
+                    self.assertFalse(report["qualification_gates"][gate], gate)
+            # Untrusted report values must not earn a single external point, not even in the
+            # would-be raw score: dropping the report_trusted guard from external_qualified would
+            # light these components up and this assertion would fail.
+            self.assertEqual(set(report["details"]["external"].values()), {0.0})
+            self.assertEqual(report["category_scores"]["external_footprint_intelligence"], 0.0)
+            self.assertEqual(report["awardable_score"], 0)
+
+            derived = subprocess.run(
+                command + ["--observations", str(self.FIXTURES / "external-observations-valid.jsonl"),
+                           "--labels", str(self.FIXTURES / "external-audit-labels.synthetic.jsonl")],
+                cwd=ROOT, capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(derived.returncode, 0, derived.stderr[-400:])
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["measurement_source"], "derived_from_artifacts")
+            self.assertFalse(report["qualification_gates"]["external_report_consistent"])
+            self.assertTrue(report["external_report_mismatches"])
+            self.assertEqual(report["awardable_score"], 0)
+
+
+class IntegrityHardeningTests(unittest.TestCase):
+    """Regressions for the second remediation pass (S1-S6 contract and input integrity).
+
+    Each test targets behaviour that was wrong on the frozen tree before this pass: malformed claim
+    fields raised TypeError out of the validator, external counts were never cross-checked against
+    the ids they summarise, and the timestamps, organisation numbers, claim values and non-UTF-8
+    inputs listed below were accepted or crashed.
+    """
+
+    def observation(self, **changes):
+        base = {
+            "id": "obs-1",
+            "organisation_number": "923609016",
+            "platform": "google_places",
+            "signal_type": "place_summary",
+            "source_url": "https://maps.example.invalid/place/example",
+            "retrieved_at": "2026-08-20T00:00:00Z",
+            "content_sha256": "a" * 64,
+            "exact_entity": True,
+            "identity_proof": [{"type": "synthetic_identity_proof"}],
+            "acquisition_mode": "official_api",
+            "rights_status": "approved",
+            "source_class": "public_business_listing",
+        }
+        return {**base, **changes}
+
+    def profile(self, **changes):
+        profile = {
+            "organisation_number": "923609016",
+            "name": "AF GRUPPEN ASA",
+            "evidence": {
+                "registry": evidence("registry", "available", "official_registry_bulk", "https://data.brreg.no/x", value={"navn": "AF GRUPPEN ASA"}),
+                "financials": evidence("financials", "not_found", "official_registry_api", "https://data.brreg.no/y", note="No annual accounts"),
+                "website": evidence("website", "blocked", "registry_linked_company_website", "https://afgruppen.no/", note="robots.txt disallowed"),
+            },
+            "run_metrics": {"requests": 2, "runtime_ms": 12},
+        }
+        return {**profile, **changes}
+
+    def envelope(self, **changes):
+        return contract_envelope(
+            self.profile(),
+            run_id="run-hardening",
+            modules=["registry", "financials", "website"],
+            started_at="2026-08-24T00:00:00Z",
+            completed_at="2026-08-24T00:00:05Z",
+            **changes,
+        )
+
+    def external_block(self, *, accepted=1, rejected=1, stale=0, count_scope="accepted"):
+        """A hand-built block that satisfies every cross-check, for tampering in tests."""
+        accepted_ids = [f"a{i}" for i in range(1, accepted + 1)]
+        rejected_entries = [{"id": f"r{i}", "reasons": ["source rights are not approved"]} for i in range(1, rejected + 1)]
+        fresh = accepted - stale
+        return {
+            "organisation_number": "923609016",
+            "publishable_only": True,
+            "counts_scope": count_scope,
+            "accepted_observation_ids": accepted_ids,
+            "stale_observation_ids": accepted_ids[-stale:] if stale else [],
+            "rejected_observations": rejected_entries,
+            "footprint": {
+                "status": "available" if accepted else "not_available",
+                "accepted_observations": accepted,
+                "counted_observations": fresh if count_scope == "fresh" else accepted,
+                "counts_scope": count_scope,
+                "rejected_observations": rejected,
+                "rejections": rejected_entries,
+                "fresh_observations": fresh,
+                "stale_observations": stale,
+                "undated_observations": 0,
+            },
+        }
+
+    # ------------------------------------------------------------------ S1
+    def test_s1_malformed_claim_field_types_return_errors_instead_of_raising(self):
+        for bad in (None, {"a": 1}, 7, 2.5, True, "", "   "):
+            with self.subTest(field=bad):
+                envelope = self.envelope()
+                envelope["claims"][0]["field"] = bad
+                result = validate_contract_envelope(envelope)
+                self.assertFalse(result["passed"])
+                self.assertIn("claim #1 field must be a non-empty string", result["errors"])
+
+        envelope = self.envelope()
+        del envelope["claims"][0]["field"]
+        result = validate_contract_envelope(envelope)
+        self.assertIn("claim #1 field must be a non-empty string", result["errors"])
+
+    def test_s1_one_malformed_claim_does_not_cancel_validation_of_the_rest(self):
+        envelope = self.envelope()
+        envelope["claims"][0]["field"] = None
+        envelope["claims"][1]["confidence"] = 1.5
+        result = validate_contract_envelope(envelope)
+        self.assertIn("claim #1 field must be a non-empty string", result["errors"])
+        # The second claim is still validated in full, under its own valid label.
+        self.assertIn("claim financials has an invalid confidence", result["errors"])
+        # No TypeError, and no misleading module-coverage error caused by the untyped field.
+        self.assertNotIn("claims must cover exactly the requested modules", result["errors"])
+
+    def test_s1_valid_claims_still_cover_the_requested_modules(self):
+        self.assertTrue(validate_contract_envelope(self.envelope())["passed"])
+        envelope = self.envelope()
+        envelope["modules"].pop("website")
+        result = validate_contract_envelope(envelope)
+        self.assertIn("claims must cover exactly the requested modules", result["errors"])
+
+    def test_s1_non_string_module_names_do_not_raise(self):
+        envelope = self.envelope()
+        envelope["modules"][7] = envelope["modules"].pop("website")
+        result = validate_contract_envelope(envelope)
+        self.assertFalse(result["passed"])
+        self.assertIn("module names must be strings", result["errors"])
+
+    # ------------------------------------------------------------------ S2
+    def test_s2_matching_counts_pass_and_mismatched_counts_are_rejected(self):
+        consistent = self.envelope(external_block=self.external_block(accepted=2, rejected=1))
+        self.assertTrue(validate_contract_envelope(consistent)["passed"], validate_contract_envelope(consistent)["errors"])
+
+        for field, value, expected in (
+            ("accepted_observations", 999, "does not match the accepted observation ids (2)"),
+            ("stale_observations", 1, "does not match the stale observation ids (0)"),
+            ("rejected_observations", 0, "does not match the rejection diagnostics (1)"),
+        ):
+            with self.subTest(field=field):
+                envelope = self.envelope(external_block=self.external_block(accepted=2, rejected=1))
+                envelope["external"]["footprint"][field] = value
+                result = validate_contract_envelope(envelope)
+                self.assertFalse(result["passed"])
+                self.assertTrue(any(expected in item for item in result["errors"]), result["errors"])
+
+    def test_s2_duplicate_accepted_ids_cannot_inflate_a_count(self):
+        envelope = self.envelope(external_block=self.external_block(accepted=2, rejected=0))
+        block = envelope["external"]
+        block["accepted_observation_ids"] = ["a1", "a1"]
+        block["footprint"]["accepted_observations"] = 2
+        block["footprint"]["fresh_observations"] = 2
+        result = validate_contract_envelope(envelope)
+        self.assertFalse(result["passed"])
+        self.assertIn("external accepted_observation_ids must not repeat an identifier", result["errors"])
+
+    def test_s2_aggregation_policy_invariants_are_enforced(self):
+        envelope = self.envelope(external_block=self.external_block(accepted=3, rejected=0, stale=1))
+        envelope["external"]["footprint"]["accepted_observations"] = 4  # 4 != fresh(2) + stale(1)
+        result = validate_contract_envelope(envelope)
+        self.assertIn("external footprint accepted_observations must equal fresh + stale", result["errors"])
+
+        envelope = self.envelope(external_block=self.external_block(accepted=2, rejected=0, stale=0, count_scope="fresh"))
+        envelope["external"]["footprint"]["counted_observations"] = 2  # must follow counts_scope
+        envelope["external"]["footprint"]["fresh_observations"] = 1
+        result = validate_contract_envelope(envelope)
+        self.assertTrue(any("counted_observations must equal" in item for item in result["errors"]), result["errors"])
+
+    def test_s2_missing_footprint_and_dangling_ids_are_rejected(self):
+        envelope = self.envelope(external_block=self.external_block())
+        envelope["external"].pop("footprint")
+        result = validate_contract_envelope(envelope)
+        self.assertFalse(result["passed"])
+        self.assertIn("external block must carry a footprint object with its aggregate counts", result["errors"])
+
+        envelope = self.envelope(external_block=self.external_block())
+        envelope["external"]["stale_observation_ids"] = ["never-accepted"]
+        result = validate_contract_envelope(envelope)
+        self.assertIn("external stale observation ids must also be accepted observation ids", result["errors"])
+
+        envelope = self.envelope(external_block=self.external_block(accepted=1, rejected=0))
+        envelope["external"]["rejected_observations"] = [{"id": "a1", "reasons": ["x"]}]
+        envelope["external"]["footprint"]["rejected_observations"] = 1
+        envelope["external"]["footprint"]["rejections"] = [{"id": "a1", "reasons": ["x"]}]
+        result = validate_contract_envelope(envelope)
+        self.assertIn("observations cannot be both accepted and rejected: ['a1']", result["errors"])
+
+    def test_s2_empty_and_absent_external_evidence_stay_valid(self):
+        empty = self.envelope(external_block=self.external_block(accepted=0, rejected=0))
+        self.assertTrue(validate_contract_envelope(empty)["passed"], validate_contract_envelope(empty)["errors"])
+        self.assertEqual(empty["external"]["footprint"]["status"], "not_available")
+        self.assertTrue(validate_contract_envelope(self.envelope())["passed"])
+
+    def test_s2_real_gate_block_satisfies_every_cross_check(self):
+        records = [
+            self.observation(**{"id": "keep"}),
+            self.observation(**{"id": "drop-rights", "rights_status": "review_required"}),
+            self.observation(**{"id": "drop-dupe", "source_url": "https://maps.example.invalid/place/dupe"}),
+            self.observation(**{"id": "drop-dupe", "source_url": "https://maps.example.invalid/place/dupe-2"}),
+        ]
+        gate = gate_observations(records, organisation_numbers=["923609016"], as_of="2026-08-24T00:00:00Z")
+        block = company_external_block(gate, "923609016")
+        envelope = self.envelope(external_block=block)
+        result = validate_contract_envelope(envelope)
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual(len(block["accepted_observation_ids"]), block["footprint"]["accepted_observations"])
+        self.assertEqual(len(block["rejected_observations"]), block["footprint"]["rejected_observations"])
+        self.assertEqual(len(block["footprint"]["rejections"]), block["footprint"]["rejected_observations"])
+
+    # ------------------------------------------------------------------ S3
+    def test_s3_claims_without_data_must_not_carry_a_value(self):
+        envelope = self.envelope()
+        for claim in envelope["claims"]:
+            if claim["field"] == "financials":
+                claim["value"] = {"profit": 1}
+        result = validate_contract_envelope(envelope)
+        self.assertFalse(result["passed"])
+        self.assertIn("claim financials must not carry a value when availability is not_available", result["errors"])
+
+        available = self.envelope()
+        self.assertIsNotNone(available["claims"][0]["value"])
+        self.assertTrue(validate_contract_envelope(available)["passed"])
+
+    # ------------------------------------------------------------------ S4
+    def test_s4_non_utf8_observation_file_raises_a_structured_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "not-utf8.jsonl"
+            path.write_bytes(b'{"id": "x", "organisation_number": "\xc3\x28"}\n')
+            with self.assertRaises(ObservationInputError) as raised:
+                read_observation_file(path)
+            message = str(raised.exception)
+            self.assertIn("Cannot read external observation file", message)
+            self.assertIn("not valid UTF-8", message)
+            self.assertIn(str(path), message)
+
+            decodable = Path(directory) / "mixed.jsonl"
+            decodable.write_text('{"id": "ok"}\nnot json\n', encoding="utf-8")
+            records, malformed = read_observation_file(decodable)
+            self.assertEqual([record["id"] for record in records], ["ok"])
+            self.assertEqual(len(malformed), 1)
+
+    # ------------------------------------------------------------------ S5
+    def test_s5_run_timestamps_must_be_iso_8601(self):
+        for bad in ("yesterday", "2026-13-45T99:99:99Z", "24/08/2026"):
+            with self.subTest(value=bad):
+                envelope = self.envelope()
+                envelope["run"]["started_at"] = bad
+                result = validate_contract_envelope(envelope)
+                self.assertFalse(result["passed"])
+                self.assertIn("run.started_at must be an ISO-8601 timestamp", result["errors"])
+
+        envelope = self.envelope()
+        envelope["run"]["started_at"] = 20260824
+        result = validate_contract_envelope(envelope)
+        self.assertIn("run.started_at must be a non-empty string", result["errors"])
+
+        self.assertIsNotNone(parse_timestamp("2026-08-24T00:00:00Z"))
+        self.assertTrue(validate_contract_envelope(self.envelope())["passed"])
+
+    # ------------------------------------------------------------------ S6
+    def test_s6_organisation_number_policy_is_shared_everywhere(self):
+        self.assertIs(is_organisation_number, _is_organisation_number)
+        for bad in ("１２３４５６７８９", "01234567", "12345678", "1234567890", 923609016, "923609016 "):
+            with self.subTest(value=bad):
+                self.assertFalse(is_organisation_number(bad))
+                envelope = self.envelope()
+                envelope["organisation_number"] = bad
+                result = validate_contract_envelope(envelope)
+                self.assertIn("organisation_number must be exactly nine ASCII digits", result["errors"])
+                # The observation gate applies exactly the same policy.
+                self.assertIn("missing or invalid organisation number", validate_observation(self.observation(organisation_number=bad)))
+        self.assertTrue(is_organisation_number("923609016"))
+        self.assertTrue(validate_contract_envelope(self.envelope())["passed"])
+
+    # ------------------------------------------------------------------ S8
+    # ------------------------------------------------------------------ S7
+    def test_s7_undocumented_evidence_fields_are_rejected(self):
+        self.assertTrue(validate_contract_envelope(self.envelope())["passed"])
+
+        envelope = self.envelope()
+        envelope["evidence"][0]["internal_debug"] = {"trace": "x"}
+        result = validate_contract_envelope(envelope)
+        self.assertFalse(result["passed"])
+        self.assertTrue(
+            any("undocumented fields" in error and "internal_debug" in error for error in result["errors"]),
+            result["errors"],
+        )
+
+        # The check is an allow-list, so an internal field cannot escape it by being renamed.
+        envelope = self.envelope()
+        envelope["evidence"][0]["debug_trace"] = 1
+        result = validate_contract_envelope(envelope)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("debug_trace" in error for error in result["errors"]), result["errors"])
+
+        # A legitimately empty output (no modules requested) stays valid.
+        envelope = self.envelope()
+        envelope["modules"] = {}
+        envelope["evidence"] = []
+        envelope["claims"] = []
+        self.assertTrue(validate_contract_envelope(envelope)["passed"])
+
+    def test_s8_non_finite_measurements_earn_no_credit(self):
+        self.assertIsNone(numeric(float("nan")))
+        self.assertIsNone(numeric(float("inf")))
+        self.assertIsNone(numeric(float("-inf")))
+        self.assertIsNone(numeric(True))
+        self.assertEqual(numeric(0.5), 0.5)
+        self.assertEqual(capped(10, numeric(float("nan"))), 0.0)
+        self.assertEqual(capped(10, numeric(float("inf"))), 0.0)
+        self.assertEqual(capped(10, 1.0), 10.0)
+
+    # ------------------------------------------------------------------ S9
+    def test_s9_rejection_diagnostics_carry_json_safe_ids(self):
+        self.assertEqual(diagnostic_id("abc"), "abc")
+        self.assertIsNone(diagnostic_id(None))
+        self.assertEqual(diagnostic_id(["a", "b"]), '["a", "b"]')
+
+        gate = gate_observations(
+            [
+                self.observation(**{"id": ["a", "b"]}),
+                self.observation(**{"id": "keep"}),
+            ],
+            organisation_numbers=["923609016"],
+        )
+        block = company_external_block(gate, "923609016")
+        ids = [entry["id"] for entry in block["rejected_observations"]]
+        self.assertIn('["a", "b"]', ids)
+        self.assertTrue(all(value is None or isinstance(value, str) for value in ids))
+        self.assertTrue(validate_contract_envelope(self.envelope(external_block=block))["passed"])
+
+
+class AuditEligibilityTests(unittest.TestCase):
+    """Findings A/B/C: only distinct, conflict-free, in-batch, policy-accepted observations audit.
+
+    Each case reproduces a defect that was present on commit c0d557e: duplicate rows inflated
+    published_audited (A), out-of-batch rows inflated it (B), and every raw-input path could re-open
+    the gate because audit_records() trusted its caller (C).
+    """
+
+    ORG_A = "923609016"
+    ORG_B = "987654321"
+
+    def observation(self, org, observation_id, **changes):
+        import hashlib as _hashlib
+        base = {
+            "id": observation_id,
+            "organisation_number": org,
+            "platform": "google_places",
+            "signal_type": "place_summary",
+            "source_url": f"https://maps.example.invalid/place/{observation_id}",
+            "retrieved_at": "2026-08-20T00:00:00Z",
+            "content_sha256": _hashlib.sha256(observation_id.encode()).hexdigest(),
+            "exact_entity": True,
+            "identity_proof": [{"type": "synthetic_identity_proof"}],
+            "acquisition_mode": "official_api",
+            "rights_status": "approved",
+            "source_class": "public_business_listing",
+        }
+        return {**base, **changes}
+
+    def label(self, org, observation_id, **changes):
+        return {"organisation_number": org, "id": observation_id, "exact_entity": True, "metric_correct": True, **changes}
+
+    def distinct(self, org, count, prefix="distinct", **changes):
+        return [self.observation(org, f"{prefix}-{index:03d}", **changes) for index in range(count)]
+
+    def distinct_labels(self, org, count, prefix="distinct", **changes):
+        return [self.label(org, f"{prefix}-{index:03d}", **changes) for index in range(count)]
+
+    def audit(self, observations, labels, batch, minimum=100):
+        return audit_records(observations, labels, minimum_audit=minimum, organisation_numbers=batch)
+
+    # ---------------------------------------------------------------- Finding A
+    def test_a1_one_observation_repeated_100_times_cannot_qualify(self):
+        audit = self.audit([self.observation(self.ORG_A, "dup") for _ in range(100)],
+                           [self.label(self.ORG_A, "dup")], [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 1)
+        self.assertEqual(audit["audit_size"], 1)
+        self.assertFalse(audit["audit_size_gate"])
+        self.assertFalse(audit["qualification_passed"])
+        self.assertEqual(audit["eligibility"]["collapsed_identical"], 99)
+
+    def test_a2_99_copies_plus_one_distinct_counts_two(self):
+        records = [self.observation(self.ORG_A, "dup") for _ in range(99)] + [self.observation(self.ORG_A, "other")]
+        audit = self.audit(records, [self.label(self.ORG_A, "dup"), self.label(self.ORG_A, "other")], [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 2)
+        self.assertFalse(audit["qualification_passed"])
+
+    def test_a3_the_gate_still_opens_for_100_distinct_records(self):
+        audit = self.audit(self.distinct(self.ORG_A, 100), self.distinct_labels(self.ORG_A, 100), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 100)
+        self.assertTrue(audit["audit_size_gate"])
+        self.assertTrue(audit["qualification_passed"])
+
+    def test_a4_conflicting_payloads_for_one_identity_are_withheld(self):
+        conflict = [
+            self.observation(self.ORG_A, "conf"),
+            self.observation(self.ORG_A, "conf", content_sha256="f" * 64,
+                             source_url="https://maps.example.invalid/place/conflict"),
+        ]
+        audit = self.audit(conflict, [self.label(self.ORG_A, "conf")], [self.ORG_A], minimum=2)
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertFalse(audit["qualification_passed"])
+        self.assertEqual(len(audit["eligibility"]["conflicting_groups"]), 1)
+        self.assertEqual(audit["eligibility"]["withheld_conflict_records"], 2)
+        self.assertEqual([entry["status"] for entry in audit["eligibility"]["classifications"]],
+                         ["withheld_conflict", "withheld_conflict"])
+        # The label stays usable but can never be applied to one arbitrary payload of the group; the
+        # withheld identity is reported as labelled evidence that did not count.
+        self.assertEqual(audit["labels_usable"], 1)
+        self.assertEqual(audit["audited_unpublished"], [["923609016", "conf"]])
+
+    def test_a5_json_key_order_is_not_a_conflict(self):
+        reordered = dict(reversed(list(self.observation(self.ORG_A, "distinct-000").items())))
+        records = self.distinct(self.ORG_A, 100) + [reordered]
+        audit = self.audit(records, self.distinct_labels(self.ORG_A, 100), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 100)
+        self.assertEqual(audit["eligibility"]["conflicting_groups"], [])
+        self.assertEqual(audit["eligibility"]["collapsed_identical"], 1)
+
+    def test_a6_duplicate_labels_collapse_and_conflicting_labels_withhold_an_identity(self):
+        labels = (self.distinct_labels(self.ORG_A, 100)
+                  + [self.label(self.ORG_A, "distinct-000")]                        # identical duplicate label
+                  + [self.label(self.ORG_A, "distinct-001", metric_correct=False),  # conflicting label pair
+                     self.label(self.ORG_A, "distinct-001", metric_correct=True)])
+        audit = self.audit(self.distinct(self.ORG_A, 100), labels, [self.ORG_A])
+        # Identical duplicate labels collapse harmlessly; the one conflicting identity is withheld,
+        # so exactly one of the 100 labelled observations stops counting.
+        self.assertEqual(audit["published_audited"], 99)
+        self.assertEqual(audit["labels_usable"], 99)
+        self.assertGreaterEqual(len(audit["labels_duplicate"]), 1)
+        self.assertEqual(len(audit["labels_conflicting"]), 1)
+        self.assertTrue(all(entry["identity"] != ["923609016", "distinct-001"] for entry in audit["labels_usable"].values()) if isinstance(audit["labels_usable"], dict) else True)
+        self.assertFalse(audit["qualification_passed"])
+
+    def test_a7_duplicates_cannot_inflate_precision_denominators(self):
+        records = [self.observation(self.ORG_A, "dup") for _ in range(100)]
+        labels = [self.label(self.ORG_A, "dup", exact_entity=False, metric_correct=False)]
+        audit = self.audit(records, labels, [self.ORG_A], minimum=1)
+        self.assertEqual(audit["published_audited"], 1)
+        self.assertEqual(audit["wrong_entity_publications"], 1)
+        self.assertEqual(audit["entity_precision"], 0.0)
+
+    # ---------------------------------------------------------------- Finding B
+    def test_b1_observations_for_another_organisation_cannot_qualify_a_batch(self):
+        audit = self.audit(self.distinct(self.ORG_B, 100, "b"), self.distinct_labels(self.ORG_B, 100, "b"), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertFalse(audit["qualification_passed"])
+        self.assertEqual(audit["eligibility"]["out_of_batch_records"], 100)
+
+    def test_b2_a_two_organisation_batch_audits_both(self):
+        records = self.distinct(self.ORG_A, 100) + self.distinct(self.ORG_B, 100, "b")
+        labels = self.distinct_labels(self.ORG_A, 100) + self.distinct_labels(self.ORG_B, 100, "b")
+        audit = self.audit(records, labels, [self.ORG_A, self.ORG_B])
+        self.assertEqual(audit["published_audited"], 200)
+        self.assertTrue(audit["qualification_passed"])
+
+    def test_b3_labels_for_another_batch_do_not_pull_records_into_scope(self):
+        records = self.distinct(self.ORG_A, 5) + self.distinct(self.ORG_B, 5, "b")
+        audit = self.audit(records, self.distinct_labels(self.ORG_B, 5, "b"), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertFalse(audit["qualification_passed"])
+
+    def test_b4_no_batch_keeps_the_documented_global_scope(self):
+        audit = self.audit(self.distinct(self.ORG_B, 100, "b"), self.distinct_labels(self.ORG_B, 100, "b"), None)
+        self.assertEqual(audit["published_audited"], 100)
+        self.assertTrue(audit["qualification_passed"])
+        self.assertFalse(audit["eligibility"]["batch_scoped"])
+
+    def test_b5_an_empty_batch_can_never_qualify(self):
+        audit = self.audit(self.distinct(self.ORG_A, 100), self.distinct_labels(self.ORG_A, 100), [])
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertFalse(audit["qualification_passed"])
+        self.assertTrue(audit["eligibility"]["batch_scoped"])
+
+    def test_b6_mixed_evidence_counts_only_the_batch(self):
+        records = self.distinct(self.ORG_A, 50) + self.distinct(self.ORG_B, 50, "b")
+        labels = self.distinct_labels(self.ORG_A, 50) + self.distinct_labels(self.ORG_B, 50, "b")
+        audit = self.audit(records, labels, [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 50)
+        self.assertEqual(audit["eligibility"]["eligible_records"], 50)
+
+    def test_b7_invalid_and_normalised_identifiers_are_data_errors_not_batch_misses(self):
+        zero_padded = self.distinct("000923609016", 3, "norm")
+        as_integer = [self.observation(self.ORG_A, f"int-{index}", organisation_number=int(self.ORG_A)) for index in range(3)]
+        labels = self.distinct_labels("000923609016", 3, "norm") + [self.label(self.ORG_A, f"int-{index}") for index in range(3)]
+        audit = self.audit(zero_padded + as_integer, labels, [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertEqual(audit["eligibility"]["out_of_batch_records"], 0)
+        self.assertEqual(audit["eligibility"]["ineligible_records"], 6)
+
+    def test_b8_out_of_batch_records_cannot_inflate_coverage(self):
+        records = self.distinct(self.ORG_A, 2) + self.distinct(self.ORG_B, 100, "b")
+        coverage = coverage_from_observations(records, organisation_numbers=[self.ORG_A, self.ORG_B],
+                                              as_of="2026-08-24T00:00:00Z")
+        self.assertEqual(coverage["any_external"], 1.0)
+        only_a = coverage_from_observations(records, organisation_numbers=[self.ORG_A], as_of="2026-08-24T00:00:00Z")
+        self.assertEqual(only_a["any_external"], 1.0)
+        self.assertEqual(only_a["fresh"], 1.0)
+
+    # ---------------------------------------------------------------- Finding C
+    def test_c1_c3_records_that_fail_the_publication_policy_cannot_audit(self):
+        cases = {
+            "invalid organisation number": ([self.observation("12345", f"s-{i}") for i in range(3)], lambda oid: self.label("12345", oid)),
+            "experimental acquisition mode": ([self.observation(self.ORG_A, f"e-{i}", acquisition_mode="unofficial_scraper_experiment") for i in range(3)], lambda oid: self.label(self.ORG_A, oid)),
+            "unapproved rights": ([self.observation(self.ORG_A, f"r-{i}", rights_status="pending") for i in range(3)], lambda oid: self.label(self.ORG_A, oid)),
+        }
+        for name, (records, make_label) in cases.items():
+            with self.subTest(case=name):
+                audit = self.audit(records, [make_label(item["id"]) for item in records], [self.ORG_A])
+                self.assertEqual(audit["published_audited"], 0, name)
+                self.assertFalse(audit["qualification_passed"], name)
+
+    def test_c4_out_of_batch_records_cannot_audit(self):
+        audit = self.audit(self.distinct(self.ORG_B, 100, "b"), self.distinct_labels(self.ORG_B, 100, "b"), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 0)
+
+    def test_c5_identical_duplicates_collapse_before_auditing(self):
+        audit = self.audit([self.observation(self.ORG_A, "dup") for _ in range(100)], [self.label(self.ORG_A, "dup")], [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 1)
+
+    def test_c6_conflicting_duplicates_cannot_audit(self):
+        conflict = [self.observation(self.ORG_A, "conf"),
+                    self.observation(self.ORG_A, "conf", content_sha256="e" * 64,
+                                     source_url="https://maps.example.invalid/place/elsewhere")]
+        audit = self.audit(conflict, [self.label(self.ORG_A, "conf")], [self.ORG_A], minimum=1)
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertFalse(audit["qualification_passed"])
+
+    def test_c7_valid_accepted_records_still_audit(self):
+        audit = self.audit(self.distinct(self.ORG_A, 100), self.distinct_labels(self.ORG_A, 100), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 100)
+        self.assertTrue(audit["qualification_passed"])
+
+    def test_c8_stale_records_keep_the_documented_semantics(self):
+        stale = self.distinct(self.ORG_A, 100, "stale", retrieved_at="2020-01-01T00:00:00Z")
+        audit = self.audit(stale, self.distinct_labels(self.ORG_A, 100, "stale"), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 100)
+        self.assertTrue(audit["audit_size_gate"])
+        self.assertTrue(audit["qualification_passed"])
+        self.assertEqual(audit["eligibility"]["ineligible_records"], 0)
+
+    def test_c9_raw_and_gated_inputs_produce_the_same_audit(self):
+        """The core of Finding C: a closed gate cannot be re-opened through another path."""
+        records = ([self.observation(self.ORG_A, "dup") for _ in range(3)]
+                   + [self.observation(self.ORG_A, "valid")]
+                   + [self.observation(self.ORG_B, "outside")]
+                   + [self.observation("12345", "malformed-org")]
+                   + [self.observation(self.ORG_A, "conf"), self.observation(self.ORG_A, "conf", content_sha256="d" * 64,
+                                                                             source_url="https://maps.example.invalid/place/x")])
+        labels = [self.label(self.ORG_A, name) for name in ("dup", "valid", "conf", "malformed-org")]
+        gate = gate_observations(records, organisation_numbers=[self.ORG_A])
+        from_raw = audit_records(records, labels, minimum_audit=1, organisation_numbers=[self.ORG_A])
+        from_gate = audit_records(gate["accepted"], labels, minimum_audit=1, organisation_numbers=[self.ORG_A])
+        from_unscoped_gate = audit_records(gate["accepted"], labels, minimum_audit=1, organisation_numbers=[self.ORG_A])
+        # dup (3 copies -> 1) and valid are eligible and labelled; the conflict, the out-of-batch
+        # record and the malformed identifier never count, whichever path supplies the rows.
+        self.assertEqual(from_raw["published_audited"], 2)
+        self.assertEqual(from_raw["published_audited"], from_gate["published_audited"])
+        self.assertEqual(from_raw["published_audited"], from_unscoped_gate["published_audited"])
+        self.assertEqual(from_raw["entity_precision"], from_gate["entity_precision"])
+        self.assertEqual(from_gate["eligibility"]["eligible_records"], 2)
+        # The raw path must do the withholding itself; the gated path is handed records from which the
+        # gate has already removed the conflict, so the same two records remain the only ones audited.
+        self.assertEqual(from_raw["eligibility"]["withheld_conflict_records"], 2)
+        self.assertEqual(from_gate["eligibility"]["withheld_conflict_records"], 0)
+        self.assertEqual(from_gate["eligibility"]["out_of_batch_records"], 0)
+
+    def test_c10_eligible_selector_classifies_every_record_exactly_once(self):
+        records = ([self.observation(self.ORG_A, "dup") for _ in range(2)]
+                   + [self.observation(self.ORG_A, "valid")]
+                   + [self.observation(self.ORG_B, "outside")]
+                   + [self.observation(self.ORG_A, "conf"), self.observation(self.ORG_A, "conf", content_sha256="c" * 64,
+                                                                             source_url="https://maps.example.invalid/place/y")])
+        eligible, report = eligible_observations(records, organisation_numbers=[self.ORG_A])
+        self.assertEqual([row["id"] for row in eligible], ["dup", "valid"])
+        statuses = sorted(entry["status"] for entry in report["classifications"])
+        self.assertEqual(statuses, ["eligible", "eligible", "out_of_batch", "withheld_conflict", "withheld_conflict"])
+        self.assertEqual(report["input_records"], 6)
+        self.assertEqual(report["unique_records"], 3)
+        self.assertEqual(report["collapsed_identical"], 1)
+        self.assertEqual(report["out_of_batch_records"], 1)
+        self.assertEqual(report["withheld_conflict_records"], 2)
+        self.assertEqual(report["eligible_records"], 2)
+        self.assertTrue(report["batch_scoped"])
+        withheld = [entry for entry in report["classifications"] if entry["status"] == "withheld_conflict"][0]
+        self.assertIn("conflicting duplicate observations", withheld["reasons"][0])
+
+
+class AuditCliIntegrityTests(unittest.TestCase):
+    """Workstream 5: the scorer and evaluator CLI entry points, not only the library functions."""
+
+    ORG_A = "923609016"
+    ORG_B = "987654321"
+
+    def setUp(self):
+        self.workdir = Path(tempfile.mkdtemp())
+
+    def write(self, name, rows):
+        path = self.workdir / name
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        return str(path)
+
+    def observation(self, org, observation_id, **changes):
+        import hashlib as _hashlib
+        base = {
+            "id": observation_id, "organisation_number": org, "platform": "google_places",
+            "signal_type": "place_summary", "source_url": f"https://maps.example.invalid/place/{observation_id}",
+            "retrieved_at": "2026-08-20T00:00:00Z",
+            "content_sha256": _hashlib.sha256(observation_id.encode()).hexdigest(),
+            "exact_entity": True, "identity_proof": [{"type": "synthetic_identity_proof"}],
+            "acquisition_mode": "official_api", "rights_status": "approved",
+            "source_class": "public_business_listing",
+        }
+        return {**base, **changes}
+
+    def label(self, org, observation_id, **changes):
+        return {"organisation_number": org, "id": observation_id, "exact_entity": True, "metric_correct": True, **changes}
+
+    def invoke(self, command):
+        return subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=180)
+
+    def evaluator(self, observations, labels, *, minimum):
+        profiles = self.write("profiles.jsonl", [{"organisation_number": self.ORG_A, "name": "A", "evidence": {}}])
+        output = self.workdir / f"eval-{minimum}-{Path(observations).stem}.json"
+        output.unlink(missing_ok=True)
+        done = self.invoke([sys.executable, str(ROOT / "scripts" / "evaluate_external_footprint.py"),
+                         "--profiles", profiles, "--observations", observations, "--labels", labels,
+                         "--output", str(output), "--minimum-audit", str(minimum), "--as-of", "2026-08-24T00:00:00Z"])
+        self.assertEqual(done.returncode, 0, done.stderr[-500:])
+        return json.loads(output.read_text(encoding="utf-8"))
+
+    def test_evaluator_cli_duplicates_cannot_close_the_audit_gate(self):
+        observations = self.write("dup100.jsonl", [self.observation(self.ORG_A, "dup") for _ in range(100)])
+        labels = self.write("dup100-labels.jsonl", [self.label(self.ORG_A, "dup")])
+        report = self.evaluator(observations, labels, minimum=100)
+        self.assertEqual(report["published_audited"], 1)
+        self.assertFalse(report["audit_size_gate"])
+        self.assertFalse(report["qualification_passed"])
+        self.assertEqual(report["audit_eligibility"]["collapsed_identical"], 99)
+
+    def test_evaluator_cli_out_of_batch_cannot_close_the_audit_gate(self):
+        observations = self.write("outside100.jsonl", [self.observation(self.ORG_B, f"b-{index:03d}") for index in range(100)])
+        labels = self.write("outside100-labels.jsonl", [self.label(self.ORG_B, f"b-{index:03d}") for index in range(100)])
+        report = self.evaluator(observations, labels, minimum=100)
+        self.assertEqual(report["published_audited"], 0)
+        self.assertFalse(report["qualification_passed"])
+        self.assertEqual(report["observations_out_of_batch"], 100)
+
+    def test_evaluator_cli_distinct_in_batch_records_still_qualify(self):
+        records = [self.observation(self.ORG_A, f"d-{index:03d}") for index in range(100)]
+        observations = self.write("distinct100.jsonl", records)
+        labels = self.write("distinct100-labels.jsonl", [self.label(self.ORG_A, row["id"]) for row in records])
+        report = self.evaluator(observations, labels, minimum=100)
+        self.assertEqual(report["published_audited"], 100)
+        self.assertTrue(report["audit_size_gate"])
+        self.assertTrue(report["qualification_passed"])
+
+    def scorer(self, observations, labels, external_report):
+        profiles = self.write("score-profiles.jsonl", [{
+            "organisation_number": self.ORG_A, "name": "A",
+            "evidence": {"registry_live": {"value": {"organisation_number": self.ORG_A}}},
+        }])
+        batch_report = self.workdir / "batch.json"
+        batch_report.write_text(json.dumps({"validation": {"passed": True}, "emitted_envelopes": 1,
+                                            "operations": {"p95_ms": 100}}), encoding="utf-8")
+        refresh_report = self.workdir / "refresh.json"
+        refresh_report.write_text(json.dumps({"qualification_passed": True, "evidence_complete": True,
+                                              "idempotent_rerun": True}), encoding="utf-8")
+        empty = self.workdir / "empty.json"
+        empty.write_text("{}", encoding="utf-8")
+        output = self.workdir / f"score-{Path(external_report).stem}.json"
+        output.unlink(missing_ok=True)
+        done = self.invoke([sys.executable, str(ROOT / "scripts" / "score_competition_v3.py"),
+                         "--profiles", profiles, "--external-report", external_report,
+                         "--batch-report", str(batch_report), "--refresh-report", str(refresh_report),
+                         "--research-report", str(empty), "--ux-report", str(empty),
+                         "--observations", observations, "--labels", labels,
+                         "--as-of", "2026-08-24T00:00:00Z", "--output", str(output)])
+        self.assertEqual(done.returncode, 0, done.stderr[-500:])
+        return json.loads(output.read_text(encoding="utf-8"))
+
+    def test_scorer_cli_derives_from_artifacts_and_rejects_a_fabricated_audit_claim(self):
+        observations = self.write("score-dup100.jsonl", [self.observation(self.ORG_A, "dup") for _ in range(100)])
+        labels = self.write("score-dup100-labels.jsonl", [self.label(self.ORG_A, "dup")])
+        fabricated = self.workdir / "external-fabricated.json"
+        fabricated.write_text(json.dumps({
+            "published_audited": 100, "audit_size": 100, "audit_size_gate": True, "qualification_passed": True,
+            "fresh_coverage": 1.0, "connector_policy_passed": True,
+            "coverage": {"two_platforms": 1.0, "workforce_jobs": 1.0, "ratings_reviews": 1.0,
+                         "buzz_engagement": 1.0, "sentiment": 1.0},
+            "wrong_entity_publications": 0, "unsupported_publications": 0,
+        }), encoding="utf-8")
+        report = self.scorer(observations, labels, str(fabricated))
+        mismatches = {entry["field"]: entry for entry in report["external_report_mismatches"]}
+        self.assertIn("published_audited", mismatches)
+        self.assertEqual(mismatches["published_audited"]["derived"], 1)
+        self.assertFalse(report["qualification_gates"]["external_audit_at_least_100"])
+        self.assertFalse(report["qualification_gates"]["external_report_consistent"])
+        self.assertEqual(report["awardable_score"], 0)
+
+    def test_scorer_cli_honest_report_agrees_with_the_derivation(self):
+        records = [self.observation(self.ORG_A, f"s-{index:03d}") for index in range(100)]
+        observations = self.write("score-distinct100.jsonl", records)
+        labels = self.write("score-distinct100-labels.jsonl", [self.label(self.ORG_A, row["id"]) for row in records])
+        honest = self.evaluator(observations, labels, minimum=100)
+        honest_path = self.workdir / "external-honest.json"
+        honest_path.write_text(json.dumps(honest), encoding="utf-8")
+        report = self.scorer(observations, labels, str(honest_path))
+        self.assertEqual(report["external_report_mismatches"], [])
+        self.assertTrue(report["qualification_gates"]["external_audit_at_least_100"])
+        self.assertEqual(report["measurement_source"], "derived_from_artifacts")
 
 
 if __name__ == "__main__":
