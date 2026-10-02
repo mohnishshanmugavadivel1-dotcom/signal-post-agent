@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# macOS / OS metadata
+._*
+.DS_Store
+Thumbs.db
+
+# Huge raw data downloads (must download via curl / setup as per README)
+brreg-enheter.csv
+signalpost-universe.jsonl.gz
+
+# Logs & scratch
+*.log
+gcm-diagnose.log
+
+# Output directory (generated run outputs)
+out/
