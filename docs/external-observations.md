@@ -91,22 +91,67 @@ validator refuses any envelope whose `profile.external_footprint` has no matchin
 `external` block, or whose accepted-observation ids do not match it, so a stale block cannot be
 republished even if a future code path reintroduces one.
 
+## Audit eligibility (authoritative policy, 2026-10-03)
+
+Only *eligible* observations may take part in any audit number. Eligibility is decided in exactly one
+place, `eligible_observations()` in `src/norway_company_agent/external_pipeline.py`, and
+`audit_records()` calls it itself — the audit is therefore identical whether a caller hands over the
+raw file rows or an already-gated list. A caller cannot re-open a closed gate by passing raw,
+rejected, duplicated or out-of-batch records.
+
+A record is eligible when **all** of the following hold:
+
+1. **Deduplicated** — identity is `(organisation_number, id)`. Identical payloads for one identity
+   collapse to the first occurrence (canonical fingerprints, so JSON key order is irrelevant).
+2. **Not conflict-withheld** — payloads that disagree for one identity are withheld *entirely* and
+   reported under `conflicting_groups`; the code never selects one payload as the winner.
+3. **In scope** — when a batch is requested, the record's organisation number must be in it. A
+   malformed identifier (not exactly nine ASCII digits, including zero-padded or integer forms) is a
+   **data error** and is reported as ineligible, never silently treated as out of scope.
+4. **Publication-policy accepted** — `validate_observation(..., organisation_number=…)` must report no
+   reason: approved rights, approved (non-experimental) acquisition mode, verified exact entity,
+   supported platform and signal type, evidence span where required, well-formed content hash.
+
+**Stale is not ineligible.** Freshness is a *reporting scope* (`counts_scope`, `fresh_coverage`,
+`stale_observation_ids`), not an eligibility rule: a stale but otherwise valid observation stays
+eligible and auditable. This preserves the documented freshness semantics; only an explicit policy
+decision may change it.
+
+**Batch scope.** `organisation_numbers=None` means no batch restriction — the documented global
+scope, every organisation is in scope. Passing an iterable (including an **empty** one) requests
+batch-scoped qualification, so an empty batch qualifies nothing. The evaluator uses the profile
+organisations as its batch (that is what `observations_out_of_batch` has always meant), and the
+scorer uses the same organisation list.
+
+Every audit report carries the decision, not just its result: `audit_records()["eligibility"]`
+contains `batch_scoped`, `organisations_requested`, input/unique/eligible/ineligible/out-of-batch/
+withheld counts, the conflicting groups, and a per-record `classifications` list where each input
+record appears exactly once as `eligible`, `ineligible`, `out_of_batch` or `withheld_conflict`. The
+evaluator publishes a compact projection of this under `audit_eligibility` plus the policy string in
+`audit_eligibility_policy`.
+
+Numbers this policy protects: `published_audited`, `audit_size`, `audit_size_gate`,
+`qualification_passed`, `entity_precision`, `metric_precision`, `sentiment_accuracy` and the
+per-organisation coverage breakdown all derive from the eligible set only, so repeating a row,
+supplying a conflicting row, or attaching evidence for an organisation outside the batch cannot
+inflate any of them. The 100-record gate consequently requires **100 distinct eligible observations**.
+
 ## Audit labels and the evaluator measurement
 
 Audit labels are keyed by the composite identity `(organisation_number, id)` — the same identity the
-gate uses — and `audit_records()` in `external_pipeline.py` is the single place where the audit
-measurement is derived:
+gate uses — and `audit_records()` is the single place where the audit measurement is derived:
 
 * identical duplicate labels collapse (reported under `labels_duplicate`);
 * conflicting labels for the same composite identity are withheld entirely, reported under
   `labels_conflicting`, and make `qualification_passed` false — the code never picks one of two
   disagreeing human judgements;
 * labels without a string `organisation_number`/`id` are reported as `labels_invalid`;
-* labels with no matching observation appear in `labels_without_observation`, and observations with
-  no label in `observations_without_labels`; `audit_coverage_by_organisation` breaks the coverage
-  down per company;
-* only publishable observations with a usable label count toward `published_audited` and
-  `audit_size_gate`.
+* labels with no eligible observation appear in `labels_without_observation`; in-scope observations
+  with no label appear in `observations_without_labels`; `audit_coverage_by_organisation` breaks the
+  coverage down per company;
+* only eligible observations with a usable label count toward `published_audited` and
+  `audit_size_gate`; a labelled identity that is in scope but did not qualify is reported under
+  `audited_unpublished` instead of being silently dropped.
 
 ## Scorer trust boundary (`score_competition_v3.py`)
 
@@ -116,7 +161,11 @@ supplied it re-derives them instead of trusting the report:
 * `--observations PATH` → `coverage`, `fresh_coverage` and `connector_policy_passed` are computed by
   gating the observation file;
 * `--observations PATH --labels PATH` → audit counts, precision figures, `audit_size_gate` and
-  `qualification_passed` are computed by `audit_records()`.
+  `qualification_passed` are computed by `audit_records()` over the gate's accepted records and the
+  profile-derived batch. Audit eligibility (deduplication, conflict withholding, batch membership,
+  publication policy) is enforced inside `audit_records()` by the shared selector, so this path and a
+  raw-rows path produce the same measurement — asserted by
+  `AuditEligibilityTests::test_c9_raw_and_gated_inputs_produce_the_same_audit`.
 
 Any disagreement between the report and the derived values is listed in
 `external_report_mismatches`, fails the `external_report_consistent` gate, and cannot qualify a

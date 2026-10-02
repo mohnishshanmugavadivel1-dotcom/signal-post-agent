@@ -174,8 +174,13 @@ def derive_external_measurements(args, profiles: list[dict[str, Any]]) -> dict[s
     }
     if args.labels:
         label_rows, _ = read_observation_file(args.labels)
+        # The audit is given the gate's accepted records AND the batch scope. audit_records() enforces
+        # eligibility itself (deduplication, conflict withholding, batch membership, publication
+        # policy), so this path and a raw-rows path produce the same measurement — that equivalence is
+        # asserted in tests. Passing raw rows here would be equally safe; passing the gated set keeps
+        # the scorer honest about which evidence it is auditing.
         audit = audit_records(
-            records,
+            gate["accepted"],
             label_rows,
             minimum_audit=args.minimum_audit,
             organisation_numbers=organisation_numbers,

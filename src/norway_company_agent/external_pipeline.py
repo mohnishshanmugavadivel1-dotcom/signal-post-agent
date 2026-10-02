@@ -403,6 +403,123 @@ def _observation_is_fresh(item: dict[str, Any], *, as_of: str | None, freshness_
 
 AUDIT_IDENTITY_POLICY = "organisation_number + id"
 
+AUDIT_ELIGIBILITY_POLICY = (
+    "Audit eligibility is decided in one place (eligible_observations): identity is "
+    "(organisation_number, id); identical duplicates collapse to their first occurrence; payloads that "
+    "conflict for one identity are withheld entirely and diagnosed; when a batch is requested, records "
+    "outside it are excluded; records that fail the publication policy are ineligible. Freshness is a "
+    "reporting scope, not an eligibility rule, so stale records stay eligible."
+)
+
+
+def eligible_observations(
+    observations: list[dict[str, Any]],
+    *,
+    organisation_numbers: Iterable[str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The single authoritative selector for records that may take part in audit calculations.
+
+    Returns ``(eligible_records, report)``. Every record is classified exactly once:
+
+    * ``withheld_conflict`` — its identity had payloads that disagree, so the whole group is withheld
+      (never one arbitrary winner) and reported under ``duplicates.conflicting_groups``;
+    * ``ineligible`` — it does not satisfy the publication policy (unapproved rights/mode, malformed
+      hash, unverified entity, unsupported platform/signal, or an organisation number that is not
+      nine ASCII digits, which is a data error and never an "outside batch" record);
+    * ``out_of_batch`` — a well-formed record for an organisation outside the requested batch;
+    * ``eligible`` — deduplicated, in scope, and publishable; these and only these may be audited.
+
+    ``organisation_numbers=None`` means "no batch restriction": every organisation is in scope, which
+    is the documented global behaviour. Passing an iterable (including an empty one) requests
+    batch-scoped qualification, so an empty batch can never qualify anything.
+
+    This function is the reason callers cannot re-open a closed gate: :func:`audit_records` runs it
+    itself, so handing raw, rejected, duplicated or out-of-batch rows to the audit path cannot change
+    the outcome. Reusing it keeps the scorer and the evaluator from drifting apart.
+    """
+    requested: set[str] | None = None if organisation_numbers is None else {str(org) for org in organisation_numbers}
+    unique, duplicates = deduplicate_observations(observations)
+    conflicted_keys = {
+        (str(conflict["organisation_number"]), str(conflict["id"])) for conflict in duplicates["conflicting_groups"]
+    }
+
+    eligible: list[dict[str, Any]] = []
+    ineligible: list[dict[str, Any]] = []
+    out_of_batch: list[dict[str, Any]] = []
+    withheld: list[dict[str, Any]] = []
+    classifications: list[dict[str, Any]] = []
+
+    def classify(item: dict[str, Any], status: str, reasons: list[str] | None = None) -> None:
+        classifications.append({
+            "organisation_number": item.get("organisation_number"),
+            "id": item.get("id"),
+            "status": status,
+            "reasons": list(reasons or []),
+        })
+
+    # Conflicts are withheld by `deduplicate_observations` before this loop sees them, so they are
+    # classified here from the conflict report itself. Every input record therefore has exactly one
+    # classification, and a caller can audit the decision without re-reading the gate.
+    for conflict in duplicates["conflicting_groups"]:
+        for _ in range(conflict["occurrences"]):
+            classifications.append({
+                "organisation_number": conflict["organisation_number"],
+                "id": conflict["id"],
+                "status": "withheld_conflict",
+                "reasons": ["conflicting duplicate observations for the same organisation and id"],
+            })
+        withheld.append(conflict)
+
+    for item in unique:
+        key = (str(item.get("organisation_number") or ""), str(item.get("id") or ""))
+        org_value = item.get("organisation_number")
+        if not _is_organisation_number(org_value):
+            # A malformed identifier is a data error, never silently treated as out of scope.
+            reasons = validate_observation(item)
+            ineligible.append({"id": item.get("id"), "organisation_number": None, "reasons": reasons})
+            classify(item, "ineligible", reasons)
+            continue
+        org = str(org_value)
+        if requested is not None and org not in requested:
+            out_of_batch.append(item)
+            classify(item, "out_of_batch", ["organisation number is not part of this batch"])
+            continue
+        reasons = validate_observation(item, organisation_number=org)
+        if reasons:
+            ineligible.append({"id": item.get("id"), "organisation_number": org, "reasons": reasons})
+            classify(item, "ineligible", reasons)
+            continue
+        eligible.append(item)
+        classify(item, "eligible")
+
+    # Every deduplicated record that survived the batch filter is "in scope" for label diagnostics,
+    # whether or not it turned out to be eligible.
+    in_scope = eligible + ineligible + withheld
+    report: dict[str, Any] = {
+        "policy": AUDIT_ELIGIBILITY_POLICY,
+        "policy_version": GATE_POLICY_VERSION,
+        "identity_scope": AUDIT_IDENTITY_POLICY,
+        "batch_scoped": requested is not None,
+        "organisations_requested": sorted(requested) if requested is not None else None,
+        "input_records": len(observations),
+        "unique_records": len(unique),
+        "collapsed_identical": duplicates["collapsed_identical"],
+        "eligible_records": len(eligible),
+        "ineligible_records": len(ineligible),
+        "out_of_batch_records": len(out_of_batch),
+        "withheld_conflict_records": duplicates["conflicted_records"],
+        "conflicting_groups": duplicates["conflicting_groups"],
+        "ids_shared_across_organisations": duplicates["ids_shared_across_organisations"],
+        "content_duplicate_ids": duplicates["content_duplicate_ids"],
+        "ineligible": ineligible,
+        "out_of_batch": [
+            {"organisation_number": item.get("organisation_number"), "id": item.get("id")} for item in out_of_batch
+        ],
+        "classifications": classifications,
+        "duplicates": duplicates,
+    }
+    return eligible, report
+
 
 def audit_identity(item: dict[str, Any]) -> tuple[str, str] | None:
     """Composite identity shared by observations, audit labels and coverage.
@@ -467,25 +584,37 @@ def audit_records(
     """Derive the audit measurement from the observation and label artefacts.
 
     This is the single place where audit numbers are computed, so the evaluator report and the
-    competition proxy cannot disagree about what was audited. Only published (policy-accepted)
-    observations that carry a usable label for their composite identity count toward
-    ``published_audited`` and ``audit_size_gate``; a label for an unpublished record, a label for an
-    absent record, a duplicate label and a conflicting label are all reported separately.
+    competition proxy cannot disagree about what was audited.
+
+    The function enforces eligibility itself — it does not trust the caller to have pre-filtered the
+    rows. It runs :func:`eligible_observations` over whatever it is given, so duplicate rows,
+    conflicting payloads, out-of-batch records and records that fail the publication policy can never
+    reach the audit counters through *any* call path. Passing the gate's accepted list or the raw file
+    rows therefore yields the same result, which is what closes the "already-gated caller" gap.
+
+    ``organisation_numbers=None`` keeps the documented global scope (every organisation); passing an
+    iterable requests batch-scoped qualification, and an empty batch qualifies nothing.
     """
+    eligible, eligibility = eligible_observations(observations, organisation_numbers=organisation_numbers)
     audit = build_audit_index(labels)
     usable = audit["usable"]
-    observation_keys = {key for key in (audit_identity(item) for item in observations) if key is not None}
+    observation_keys = {key for key in (audit_identity(item) for item in eligible) if key is not None}
 
-    published: list[tuple[tuple[str, str], dict[str, Any]]] = []
-    audited_unpublished: list[tuple[str, str]] = []
-    for item in observations:
-        key = audit_identity(item)
-        if key is None or key not in usable:
-            continue
-        if publishable_observation(item):
-            published.append((key, item))
-        else:
-            audited_unpublished.append(key)
+    # Label diagnostics cover every in-scope identity (eligible, ineligible or conflict-withheld) so an
+    # operator can see which evidence was labelled even when it did not qualify. Deriving this from the
+    # classifier's own output keeps the diagnostic scope and the eligibility decision in lockstep.
+    in_scope_keys = {
+        (str(entry["organisation_number"]), str(entry["id"]))
+        for entry in eligibility["classifications"]
+        if entry["status"] != "out_of_batch"
+        and isinstance(entry["organisation_number"], str)
+        and isinstance(entry["id"], str)
+    }
+
+    published = [(key, item) for item in eligible if (key := audit_identity(item)) in usable]
+    # A labelled identity that is in scope but did not reach the eligible set: labelled evidence that
+    # cannot count, reported rather than quietly dropped.
+    audited_unpublished = sorted(key for key in in_scope_keys - observation_keys if key in usable)
 
     wrong_entity = sum(not usable[key].get("exact_entity", False) for key, _ in published)
     wrong_metric = sum(not usable[key].get("metric_correct", False) for key, _ in published)
@@ -510,8 +639,16 @@ def audit_records(
         and metric_precision >= 0.98
     )
 
+    # Coverage is reported for the batch plus every identity that was actually seen in scope. Without
+    # a batch restriction the previous behaviour (requested organisations plus record and label orgs)
+    # is preserved.
+    coverage_orgs = {key[0] for key in in_scope_keys} | {key[0] for key in observation_keys}
+    if organisation_numbers is not None:
+        coverage_orgs |= {str(org) for org in organisation_numbers}
+    else:
+        coverage_orgs |= {key[0] for key in usable}
     coverage_by_organisation: dict[str, dict[str, int]] = {}
-    for org in sorted(set(organisation_numbers or []) | {key[0] for key in observation_keys} | {key[0] for key in usable}):
+    for org in sorted(coverage_orgs):
         coverage_by_organisation[org] = {
             "labels": sum(1 for key in usable if key[0] == org),
             "published_audited": sum(1 for key, _ in published if key[0] == org),
@@ -520,6 +657,8 @@ def audit_records(
 
     return {
         "identity_policy": AUDIT_IDENTITY_POLICY,
+        "eligibility_policy": AUDIT_ELIGIBILITY_POLICY,
+        "eligibility": eligibility,
         "labels_total": len(labels),
         "labels_valid": len(audit["index"]),
         "labels_usable": len(usable),

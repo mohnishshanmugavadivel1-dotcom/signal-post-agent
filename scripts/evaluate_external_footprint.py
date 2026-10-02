@@ -35,7 +35,11 @@ from norway_company_agent.external_footprint import (  # noqa: E402
     parse_timestamp,
     publishable_observation,
 )
-from norway_company_agent.external_pipeline import audit_records, coverage_from_observations  # noqa: E402
+from norway_company_agent.external_pipeline import (  # noqa: E402
+    audit_records,
+    coverage_from_observations,
+    eligible_observations,
+)
 
 
 def read_jsonl(path: Path, *, strict: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -127,11 +131,13 @@ def main() -> None:
             % (len(audit["labels_invalid"]), len(audit["labels_conflicting"])),
             file=sys.stderr,
         )
-    # Only observations for organisations in the frozen batch can count toward coverage; anything
-    # else is reported separately so an out-of-batch record can never inflate a company's coverage.
-    in_batch = [item for item in observations if str(item.get("organisation_number")) in all_orgs]
-    out_of_batch = len(observations) - len(in_batch)
-    accepted_all = [item for item in in_batch if publishable_observation(item)]
+    # Every metric that consumes external evidence is derived from the same authoritative eligible
+    # set: deduplicated by (organisation_number, id), conflict-free, inside the frozen batch (the
+    # profile organisations) and publication-policy-accepted. Repeating a row, adding a conflicting
+    # row, or attaching evidence for an organisation outside the batch therefore cannot inflate any
+    # number in this report.
+    eligible, eligibility = eligible_observations(observations, organisation_numbers=all_orgs)
+    accepted_all = eligible
     fresh_all = [item for item in accepted_all if is_fresh(item, as_of=args.as_of, freshness_days=args.freshness_days)]
     fresh_object_ids = {id(item) for item in fresh_all}
     stale_all = [item for item in accepted_all if id(item) not in fresh_object_ids]
@@ -139,12 +145,14 @@ def main() -> None:
     # Coverage shares come from the shared helper so the evaluator and the competition proxy
     # cannot report different coverage for the same artefacts.
     coverage = coverage_from_observations(
-        observations,
+        eligible,
         organisation_numbers=all_orgs,
         as_of=args.as_of,
         freshness_days=args.freshness_days,
     )
-    acquisition_modes = Counter(str(item.get("acquisition_mode")) for item in observations)
+    acquisition_modes = Counter(str(item.get("acquisition_mode")) for item in eligible)
+    in_batch = len(eligibility["classifications"]) - eligibility["out_of_batch_records"]
+    out_of_batch = eligibility["out_of_batch_records"]
     qualification = bool(audit["qualification_passed"] and not audit["labels_invalid"] and not audit["labels_conflicting"])
     fresh_coverage = coverage["fresh"]
     policy_passed, policy_detail = connector_policy(accepted_all)
@@ -155,9 +163,26 @@ def main() -> None:
         "observations": len(observations),
         "malformed_profiles": malformed_profiles,
         "malformed_observations": malformed_observations,
-        "observations_in_batch": len(in_batch),
+        "observations_in_batch": in_batch,
         "observations_out_of_batch": out_of_batch,
         "audit_identity_policy": audit["identity_policy"],
+        "audit_eligibility_policy": audit["eligibility_policy"],
+        # Compact view of the eligibility decision behind every number above. The full per-record
+        # classification stays in the audit structure (audit_records()["eligibility"]).
+        "audit_eligibility": {
+            "batch_scoped": eligibility["batch_scoped"],
+            "organisations_requested": eligibility["organisations_requested"],
+            "input_records": eligibility["input_records"],
+            "unique_records": eligibility["unique_records"],
+            "collapsed_identical": eligibility["collapsed_identical"],
+            "eligible_records": eligibility["eligible_records"],
+            "ineligible_records": eligibility["ineligible_records"],
+            "out_of_batch_records": eligibility["out_of_batch_records"],
+            "withheld_conflict_records": eligibility["withheld_conflict_records"],
+            "conflicting_groups": eligibility["conflicting_groups"],
+            "ineligible": eligibility["ineligible"],
+            "out_of_batch": eligibility["out_of_batch"],
+        },
         "audited_observations": audit["audited_observations"],
         "published_audited": audit["published_audited"],
         "wrong_entity_publications": audit["wrong_entity_publications"],

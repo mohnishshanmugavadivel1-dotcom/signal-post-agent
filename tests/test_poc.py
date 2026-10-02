@@ -38,7 +38,9 @@ from norway_company_agent.external_pipeline import (  # noqa: E402
     ObservationInputError,
     audit_records,
     company_external_block,
+    coverage_from_observations,
     deduplicate_observations,
+    eligible_observations,
     gate_observations,
     read_observation_file,
     run_external_summary,
@@ -2323,6 +2325,389 @@ class IntegrityHardeningTests(unittest.TestCase):
         self.assertIn('["a", "b"]', ids)
         self.assertTrue(all(value is None or isinstance(value, str) for value in ids))
         self.assertTrue(validate_contract_envelope(self.envelope(external_block=block))["passed"])
+
+
+class AuditEligibilityTests(unittest.TestCase):
+    """Findings A/B/C: only distinct, conflict-free, in-batch, policy-accepted observations audit.
+
+    Each case reproduces a defect that was present on commit c0d557e: duplicate rows inflated
+    published_audited (A), out-of-batch rows inflated it (B), and every raw-input path could re-open
+    the gate because audit_records() trusted its caller (C).
+    """
+
+    ORG_A = "923609016"
+    ORG_B = "987654321"
+
+    def observation(self, org, observation_id, **changes):
+        import hashlib as _hashlib
+        base = {
+            "id": observation_id,
+            "organisation_number": org,
+            "platform": "google_places",
+            "signal_type": "place_summary",
+            "source_url": f"https://maps.example.invalid/place/{observation_id}",
+            "retrieved_at": "2026-08-20T00:00:00Z",
+            "content_sha256": _hashlib.sha256(observation_id.encode()).hexdigest(),
+            "exact_entity": True,
+            "identity_proof": [{"type": "synthetic_identity_proof"}],
+            "acquisition_mode": "official_api",
+            "rights_status": "approved",
+            "source_class": "public_business_listing",
+        }
+        return {**base, **changes}
+
+    def label(self, org, observation_id, **changes):
+        return {"organisation_number": org, "id": observation_id, "exact_entity": True, "metric_correct": True, **changes}
+
+    def distinct(self, org, count, prefix="distinct", **changes):
+        return [self.observation(org, f"{prefix}-{index:03d}", **changes) for index in range(count)]
+
+    def distinct_labels(self, org, count, prefix="distinct", **changes):
+        return [self.label(org, f"{prefix}-{index:03d}", **changes) for index in range(count)]
+
+    def audit(self, observations, labels, batch, minimum=100):
+        return audit_records(observations, labels, minimum_audit=minimum, organisation_numbers=batch)
+
+    # ---------------------------------------------------------------- Finding A
+    def test_a1_one_observation_repeated_100_times_cannot_qualify(self):
+        audit = self.audit([self.observation(self.ORG_A, "dup") for _ in range(100)],
+                           [self.label(self.ORG_A, "dup")], [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 1)
+        self.assertEqual(audit["audit_size"], 1)
+        self.assertFalse(audit["audit_size_gate"])
+        self.assertFalse(audit["qualification_passed"])
+        self.assertEqual(audit["eligibility"]["collapsed_identical"], 99)
+
+    def test_a2_99_copies_plus_one_distinct_counts_two(self):
+        records = [self.observation(self.ORG_A, "dup") for _ in range(99)] + [self.observation(self.ORG_A, "other")]
+        audit = self.audit(records, [self.label(self.ORG_A, "dup"), self.label(self.ORG_A, "other")], [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 2)
+        self.assertFalse(audit["qualification_passed"])
+
+    def test_a3_the_gate_still_opens_for_100_distinct_records(self):
+        audit = self.audit(self.distinct(self.ORG_A, 100), self.distinct_labels(self.ORG_A, 100), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 100)
+        self.assertTrue(audit["audit_size_gate"])
+        self.assertTrue(audit["qualification_passed"])
+
+    def test_a4_conflicting_payloads_for_one_identity_are_withheld(self):
+        conflict = [
+            self.observation(self.ORG_A, "conf"),
+            self.observation(self.ORG_A, "conf", content_sha256="f" * 64,
+                             source_url="https://maps.example.invalid/place/conflict"),
+        ]
+        audit = self.audit(conflict, [self.label(self.ORG_A, "conf")], [self.ORG_A], minimum=2)
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertFalse(audit["qualification_passed"])
+        self.assertEqual(len(audit["eligibility"]["conflicting_groups"]), 1)
+        self.assertEqual(audit["eligibility"]["withheld_conflict_records"], 2)
+        self.assertEqual([entry["status"] for entry in audit["eligibility"]["classifications"]],
+                         ["withheld_conflict", "withheld_conflict"])
+        # The label stays usable but can never be applied to one arbitrary payload of the group; the
+        # withheld identity is reported as labelled evidence that did not count.
+        self.assertEqual(audit["labels_usable"], 1)
+        self.assertEqual(audit["audited_unpublished"], [["923609016", "conf"]])
+
+    def test_a5_json_key_order_is_not_a_conflict(self):
+        reordered = dict(reversed(list(self.observation(self.ORG_A, "distinct-000").items())))
+        records = self.distinct(self.ORG_A, 100) + [reordered]
+        audit = self.audit(records, self.distinct_labels(self.ORG_A, 100), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 100)
+        self.assertEqual(audit["eligibility"]["conflicting_groups"], [])
+        self.assertEqual(audit["eligibility"]["collapsed_identical"], 1)
+
+    def test_a6_duplicate_labels_collapse_and_conflicting_labels_withhold_an_identity(self):
+        labels = (self.distinct_labels(self.ORG_A, 100)
+                  + [self.label(self.ORG_A, "distinct-000")]                        # identical duplicate label
+                  + [self.label(self.ORG_A, "distinct-001", metric_correct=False),  # conflicting label pair
+                     self.label(self.ORG_A, "distinct-001", metric_correct=True)])
+        audit = self.audit(self.distinct(self.ORG_A, 100), labels, [self.ORG_A])
+        # Identical duplicate labels collapse harmlessly; the one conflicting identity is withheld,
+        # so exactly one of the 100 labelled observations stops counting.
+        self.assertEqual(audit["published_audited"], 99)
+        self.assertEqual(audit["labels_usable"], 99)
+        self.assertGreaterEqual(len(audit["labels_duplicate"]), 1)
+        self.assertEqual(len(audit["labels_conflicting"]), 1)
+        self.assertTrue(all(entry["identity"] != ["923609016", "distinct-001"] for entry in audit["labels_usable"].values()) if isinstance(audit["labels_usable"], dict) else True)
+        self.assertFalse(audit["qualification_passed"])
+
+    def test_a7_duplicates_cannot_inflate_precision_denominators(self):
+        records = [self.observation(self.ORG_A, "dup") for _ in range(100)]
+        labels = [self.label(self.ORG_A, "dup", exact_entity=False, metric_correct=False)]
+        audit = self.audit(records, labels, [self.ORG_A], minimum=1)
+        self.assertEqual(audit["published_audited"], 1)
+        self.assertEqual(audit["wrong_entity_publications"], 1)
+        self.assertEqual(audit["entity_precision"], 0.0)
+
+    # ---------------------------------------------------------------- Finding B
+    def test_b1_observations_for_another_organisation_cannot_qualify_a_batch(self):
+        audit = self.audit(self.distinct(self.ORG_B, 100, "b"), self.distinct_labels(self.ORG_B, 100, "b"), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertFalse(audit["qualification_passed"])
+        self.assertEqual(audit["eligibility"]["out_of_batch_records"], 100)
+
+    def test_b2_a_two_organisation_batch_audits_both(self):
+        records = self.distinct(self.ORG_A, 100) + self.distinct(self.ORG_B, 100, "b")
+        labels = self.distinct_labels(self.ORG_A, 100) + self.distinct_labels(self.ORG_B, 100, "b")
+        audit = self.audit(records, labels, [self.ORG_A, self.ORG_B])
+        self.assertEqual(audit["published_audited"], 200)
+        self.assertTrue(audit["qualification_passed"])
+
+    def test_b3_labels_for_another_batch_do_not_pull_records_into_scope(self):
+        records = self.distinct(self.ORG_A, 5) + self.distinct(self.ORG_B, 5, "b")
+        audit = self.audit(records, self.distinct_labels(self.ORG_B, 5, "b"), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertFalse(audit["qualification_passed"])
+
+    def test_b4_no_batch_keeps_the_documented_global_scope(self):
+        audit = self.audit(self.distinct(self.ORG_B, 100, "b"), self.distinct_labels(self.ORG_B, 100, "b"), None)
+        self.assertEqual(audit["published_audited"], 100)
+        self.assertTrue(audit["qualification_passed"])
+        self.assertFalse(audit["eligibility"]["batch_scoped"])
+
+    def test_b5_an_empty_batch_can_never_qualify(self):
+        audit = self.audit(self.distinct(self.ORG_A, 100), self.distinct_labels(self.ORG_A, 100), [])
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertFalse(audit["qualification_passed"])
+        self.assertTrue(audit["eligibility"]["batch_scoped"])
+
+    def test_b6_mixed_evidence_counts_only_the_batch(self):
+        records = self.distinct(self.ORG_A, 50) + self.distinct(self.ORG_B, 50, "b")
+        labels = self.distinct_labels(self.ORG_A, 50) + self.distinct_labels(self.ORG_B, 50, "b")
+        audit = self.audit(records, labels, [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 50)
+        self.assertEqual(audit["eligibility"]["eligible_records"], 50)
+
+    def test_b7_invalid_and_normalised_identifiers_are_data_errors_not_batch_misses(self):
+        zero_padded = self.distinct("000923609016", 3, "norm")
+        as_integer = [self.observation(self.ORG_A, f"int-{index}", organisation_number=int(self.ORG_A)) for index in range(3)]
+        labels = self.distinct_labels("000923609016", 3, "norm") + [self.label(self.ORG_A, f"int-{index}") for index in range(3)]
+        audit = self.audit(zero_padded + as_integer, labels, [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertEqual(audit["eligibility"]["out_of_batch_records"], 0)
+        self.assertEqual(audit["eligibility"]["ineligible_records"], 6)
+
+    def test_b8_out_of_batch_records_cannot_inflate_coverage(self):
+        records = self.distinct(self.ORG_A, 2) + self.distinct(self.ORG_B, 100, "b")
+        coverage = coverage_from_observations(records, organisation_numbers=[self.ORG_A, self.ORG_B],
+                                              as_of="2026-08-24T00:00:00Z")
+        self.assertEqual(coverage["any_external"], 1.0)
+        only_a = coverage_from_observations(records, organisation_numbers=[self.ORG_A], as_of="2026-08-24T00:00:00Z")
+        self.assertEqual(only_a["any_external"], 1.0)
+        self.assertEqual(only_a["fresh"], 1.0)
+
+    # ---------------------------------------------------------------- Finding C
+    def test_c1_c3_records_that_fail_the_publication_policy_cannot_audit(self):
+        cases = {
+            "invalid organisation number": ([self.observation("12345", f"s-{i}") for i in range(3)], lambda oid: self.label("12345", oid)),
+            "experimental acquisition mode": ([self.observation(self.ORG_A, f"e-{i}", acquisition_mode="unofficial_scraper_experiment") for i in range(3)], lambda oid: self.label(self.ORG_A, oid)),
+            "unapproved rights": ([self.observation(self.ORG_A, f"r-{i}", rights_status="pending") for i in range(3)], lambda oid: self.label(self.ORG_A, oid)),
+        }
+        for name, (records, make_label) in cases.items():
+            with self.subTest(case=name):
+                audit = self.audit(records, [make_label(item["id"]) for item in records], [self.ORG_A])
+                self.assertEqual(audit["published_audited"], 0, name)
+                self.assertFalse(audit["qualification_passed"], name)
+
+    def test_c4_out_of_batch_records_cannot_audit(self):
+        audit = self.audit(self.distinct(self.ORG_B, 100, "b"), self.distinct_labels(self.ORG_B, 100, "b"), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 0)
+
+    def test_c5_identical_duplicates_collapse_before_auditing(self):
+        audit = self.audit([self.observation(self.ORG_A, "dup") for _ in range(100)], [self.label(self.ORG_A, "dup")], [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 1)
+
+    def test_c6_conflicting_duplicates_cannot_audit(self):
+        conflict = [self.observation(self.ORG_A, "conf"),
+                    self.observation(self.ORG_A, "conf", content_sha256="e" * 64,
+                                     source_url="https://maps.example.invalid/place/elsewhere")]
+        audit = self.audit(conflict, [self.label(self.ORG_A, "conf")], [self.ORG_A], minimum=1)
+        self.assertEqual(audit["published_audited"], 0)
+        self.assertFalse(audit["qualification_passed"])
+
+    def test_c7_valid_accepted_records_still_audit(self):
+        audit = self.audit(self.distinct(self.ORG_A, 100), self.distinct_labels(self.ORG_A, 100), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 100)
+        self.assertTrue(audit["qualification_passed"])
+
+    def test_c8_stale_records_keep_the_documented_semantics(self):
+        stale = self.distinct(self.ORG_A, 100, "stale", retrieved_at="2020-01-01T00:00:00Z")
+        audit = self.audit(stale, self.distinct_labels(self.ORG_A, 100, "stale"), [self.ORG_A])
+        self.assertEqual(audit["published_audited"], 100)
+        self.assertTrue(audit["audit_size_gate"])
+        self.assertTrue(audit["qualification_passed"])
+        self.assertEqual(audit["eligibility"]["ineligible_records"], 0)
+
+    def test_c9_raw_and_gated_inputs_produce_the_same_audit(self):
+        """The core of Finding C: a closed gate cannot be re-opened through another path."""
+        records = ([self.observation(self.ORG_A, "dup") for _ in range(3)]
+                   + [self.observation(self.ORG_A, "valid")]
+                   + [self.observation(self.ORG_B, "outside")]
+                   + [self.observation("12345", "malformed-org")]
+                   + [self.observation(self.ORG_A, "conf"), self.observation(self.ORG_A, "conf", content_sha256="d" * 64,
+                                                                             source_url="https://maps.example.invalid/place/x")])
+        labels = [self.label(self.ORG_A, name) for name in ("dup", "valid", "conf", "malformed-org")]
+        gate = gate_observations(records, organisation_numbers=[self.ORG_A])
+        from_raw = audit_records(records, labels, minimum_audit=1, organisation_numbers=[self.ORG_A])
+        from_gate = audit_records(gate["accepted"], labels, minimum_audit=1, organisation_numbers=[self.ORG_A])
+        from_unscoped_gate = audit_records(gate["accepted"], labels, minimum_audit=1, organisation_numbers=[self.ORG_A])
+        # dup (3 copies -> 1) and valid are eligible and labelled; the conflict, the out-of-batch
+        # record and the malformed identifier never count, whichever path supplies the rows.
+        self.assertEqual(from_raw["published_audited"], 2)
+        self.assertEqual(from_raw["published_audited"], from_gate["published_audited"])
+        self.assertEqual(from_raw["published_audited"], from_unscoped_gate["published_audited"])
+        self.assertEqual(from_raw["entity_precision"], from_gate["entity_precision"])
+        self.assertEqual(from_gate["eligibility"]["eligible_records"], 2)
+        # The raw path must do the withholding itself; the gated path is handed records from which the
+        # gate has already removed the conflict, so the same two records remain the only ones audited.
+        self.assertEqual(from_raw["eligibility"]["withheld_conflict_records"], 2)
+        self.assertEqual(from_gate["eligibility"]["withheld_conflict_records"], 0)
+        self.assertEqual(from_gate["eligibility"]["out_of_batch_records"], 0)
+
+    def test_c10_eligible_selector_classifies_every_record_exactly_once(self):
+        records = ([self.observation(self.ORG_A, "dup") for _ in range(2)]
+                   + [self.observation(self.ORG_A, "valid")]
+                   + [self.observation(self.ORG_B, "outside")]
+                   + [self.observation(self.ORG_A, "conf"), self.observation(self.ORG_A, "conf", content_sha256="c" * 64,
+                                                                             source_url="https://maps.example.invalid/place/y")])
+        eligible, report = eligible_observations(records, organisation_numbers=[self.ORG_A])
+        self.assertEqual([row["id"] for row in eligible], ["dup", "valid"])
+        statuses = sorted(entry["status"] for entry in report["classifications"])
+        self.assertEqual(statuses, ["eligible", "eligible", "out_of_batch", "withheld_conflict", "withheld_conflict"])
+        self.assertEqual(report["input_records"], 6)
+        self.assertEqual(report["unique_records"], 3)
+        self.assertEqual(report["collapsed_identical"], 1)
+        self.assertEqual(report["out_of_batch_records"], 1)
+        self.assertEqual(report["withheld_conflict_records"], 2)
+        self.assertEqual(report["eligible_records"], 2)
+        self.assertTrue(report["batch_scoped"])
+        withheld = [entry for entry in report["classifications"] if entry["status"] == "withheld_conflict"][0]
+        self.assertIn("conflicting duplicate observations", withheld["reasons"][0])
+
+
+class AuditCliIntegrityTests(unittest.TestCase):
+    """Workstream 5: the scorer and evaluator CLI entry points, not only the library functions."""
+
+    ORG_A = "923609016"
+    ORG_B = "987654321"
+
+    def setUp(self):
+        self.workdir = Path(tempfile.mkdtemp())
+
+    def write(self, name, rows):
+        path = self.workdir / name
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        return str(path)
+
+    def observation(self, org, observation_id, **changes):
+        import hashlib as _hashlib
+        base = {
+            "id": observation_id, "organisation_number": org, "platform": "google_places",
+            "signal_type": "place_summary", "source_url": f"https://maps.example.invalid/place/{observation_id}",
+            "retrieved_at": "2026-08-20T00:00:00Z",
+            "content_sha256": _hashlib.sha256(observation_id.encode()).hexdigest(),
+            "exact_entity": True, "identity_proof": [{"type": "synthetic_identity_proof"}],
+            "acquisition_mode": "official_api", "rights_status": "approved",
+            "source_class": "public_business_listing",
+        }
+        return {**base, **changes}
+
+    def label(self, org, observation_id, **changes):
+        return {"organisation_number": org, "id": observation_id, "exact_entity": True, "metric_correct": True, **changes}
+
+    def invoke(self, command):
+        return subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=180)
+
+    def evaluator(self, observations, labels, *, minimum):
+        profiles = self.write("profiles.jsonl", [{"organisation_number": self.ORG_A, "name": "A", "evidence": {}}])
+        output = self.workdir / f"eval-{minimum}-{Path(observations).stem}.json"
+        output.unlink(missing_ok=True)
+        done = self.invoke([sys.executable, str(ROOT / "scripts" / "evaluate_external_footprint.py"),
+                         "--profiles", profiles, "--observations", observations, "--labels", labels,
+                         "--output", str(output), "--minimum-audit", str(minimum), "--as-of", "2026-08-24T00:00:00Z"])
+        self.assertEqual(done.returncode, 0, done.stderr[-500:])
+        return json.loads(output.read_text(encoding="utf-8"))
+
+    def test_evaluator_cli_duplicates_cannot_close_the_audit_gate(self):
+        observations = self.write("dup100.jsonl", [self.observation(self.ORG_A, "dup") for _ in range(100)])
+        labels = self.write("dup100-labels.jsonl", [self.label(self.ORG_A, "dup")])
+        report = self.evaluator(observations, labels, minimum=100)
+        self.assertEqual(report["published_audited"], 1)
+        self.assertFalse(report["audit_size_gate"])
+        self.assertFalse(report["qualification_passed"])
+        self.assertEqual(report["audit_eligibility"]["collapsed_identical"], 99)
+
+    def test_evaluator_cli_out_of_batch_cannot_close_the_audit_gate(self):
+        observations = self.write("outside100.jsonl", [self.observation(self.ORG_B, f"b-{index:03d}") for index in range(100)])
+        labels = self.write("outside100-labels.jsonl", [self.label(self.ORG_B, f"b-{index:03d}") for index in range(100)])
+        report = self.evaluator(observations, labels, minimum=100)
+        self.assertEqual(report["published_audited"], 0)
+        self.assertFalse(report["qualification_passed"])
+        self.assertEqual(report["observations_out_of_batch"], 100)
+
+    def test_evaluator_cli_distinct_in_batch_records_still_qualify(self):
+        records = [self.observation(self.ORG_A, f"d-{index:03d}") for index in range(100)]
+        observations = self.write("distinct100.jsonl", records)
+        labels = self.write("distinct100-labels.jsonl", [self.label(self.ORG_A, row["id"]) for row in records])
+        report = self.evaluator(observations, labels, minimum=100)
+        self.assertEqual(report["published_audited"], 100)
+        self.assertTrue(report["audit_size_gate"])
+        self.assertTrue(report["qualification_passed"])
+
+    def scorer(self, observations, labels, external_report):
+        profiles = self.write("score-profiles.jsonl", [{
+            "organisation_number": self.ORG_A, "name": "A",
+            "evidence": {"registry_live": {"value": {"organisation_number": self.ORG_A}}},
+        }])
+        batch_report = self.workdir / "batch.json"
+        batch_report.write_text(json.dumps({"validation": {"passed": True}, "emitted_envelopes": 1,
+                                            "operations": {"p95_ms": 100}}), encoding="utf-8")
+        refresh_report = self.workdir / "refresh.json"
+        refresh_report.write_text(json.dumps({"qualification_passed": True, "evidence_complete": True,
+                                              "idempotent_rerun": True}), encoding="utf-8")
+        empty = self.workdir / "empty.json"
+        empty.write_text("{}", encoding="utf-8")
+        output = self.workdir / f"score-{Path(external_report).stem}.json"
+        output.unlink(missing_ok=True)
+        done = self.invoke([sys.executable, str(ROOT / "scripts" / "score_competition_v3.py"),
+                         "--profiles", profiles, "--external-report", external_report,
+                         "--batch-report", str(batch_report), "--refresh-report", str(refresh_report),
+                         "--research-report", str(empty), "--ux-report", str(empty),
+                         "--observations", observations, "--labels", labels,
+                         "--as-of", "2026-08-24T00:00:00Z", "--output", str(output)])
+        self.assertEqual(done.returncode, 0, done.stderr[-500:])
+        return json.loads(output.read_text(encoding="utf-8"))
+
+    def test_scorer_cli_derives_from_artifacts_and_rejects_a_fabricated_audit_claim(self):
+        observations = self.write("score-dup100.jsonl", [self.observation(self.ORG_A, "dup") for _ in range(100)])
+        labels = self.write("score-dup100-labels.jsonl", [self.label(self.ORG_A, "dup")])
+        fabricated = self.workdir / "external-fabricated.json"
+        fabricated.write_text(json.dumps({
+            "published_audited": 100, "audit_size": 100, "audit_size_gate": True, "qualification_passed": True,
+            "fresh_coverage": 1.0, "connector_policy_passed": True,
+            "coverage": {"two_platforms": 1.0, "workforce_jobs": 1.0, "ratings_reviews": 1.0,
+                         "buzz_engagement": 1.0, "sentiment": 1.0},
+            "wrong_entity_publications": 0, "unsupported_publications": 0,
+        }), encoding="utf-8")
+        report = self.scorer(observations, labels, str(fabricated))
+        mismatches = {entry["field"]: entry for entry in report["external_report_mismatches"]}
+        self.assertIn("published_audited", mismatches)
+        self.assertEqual(mismatches["published_audited"]["derived"], 1)
+        self.assertFalse(report["qualification_gates"]["external_audit_at_least_100"])
+        self.assertFalse(report["qualification_gates"]["external_report_consistent"])
+        self.assertEqual(report["awardable_score"], 0)
+
+    def test_scorer_cli_honest_report_agrees_with_the_derivation(self):
+        records = [self.observation(self.ORG_A, f"s-{index:03d}") for index in range(100)]
+        observations = self.write("score-distinct100.jsonl", records)
+        labels = self.write("score-distinct100-labels.jsonl", [self.label(self.ORG_A, row["id"]) for row in records])
+        honest = self.evaluator(observations, labels, minimum=100)
+        honest_path = self.workdir / "external-honest.json"
+        honest_path.write_text(json.dumps(honest), encoding="utf-8")
+        report = self.scorer(observations, labels, str(honest_path))
+        self.assertEqual(report["external_report_mismatches"], [])
+        self.assertTrue(report["qualification_gates"]["external_audit_at_least_100"])
+        self.assertEqual(report["measurement_source"], "derived_from_artifacts")
 
 
 if __name__ == "__main__":
