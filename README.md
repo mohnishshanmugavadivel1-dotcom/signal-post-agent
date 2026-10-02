@@ -13,6 +13,10 @@ The public universe contains 411,160 eligible companies. Run the starter on 100 
 - emits one terminal JSONL envelope per input;
 - records sources, retrieval times, content hashes, request counts and latency;
 - supports checkpoint/resume and a deterministic refresh replay;
+- accepts gated external observations (`--external-observations`) that pass entity, rights, duplicate
+  and freshness checks before they can reach a profile, while official and external evidence stay in
+  separate layers;
+- emits the documented `OUTPUT_CONTRACT.md` fields and validates every envelope before writing it;
 - includes examples for external-footprint discovery and an evidence-bounded research agent.
 
 ## First run: try one saved example
@@ -75,9 +79,28 @@ uv run python scripts/run_competition_batch.py \
   --expected-count 1000
 
 uv run --with pytest pytest -q
+
+# Offline end-to-end check of the CLI, the external-observation gate, the contract and the
+# proxy scorer, using synthetic fixtures only. Exits non-zero if any critical check fails.
+uv run python scripts/verify_competition_e2e.py
+
+# Same batch, now with gated external observations. Omit the flag for the official-only path.
+uv run python scripts/run_competition_batch.py \
+  --organisations tests/fixtures/batch-orgs-3.jsonl \
+  --bulk tests/fixtures/bulk-registry-sample.csv.gz \
+  --profiles-output out/demo-profiles.jsonl \
+  --output out/demo-envelopes.jsonl \
+  --report out/demo-report.json \
+  --run-id demo-001 --expected-count 3 \
+  --external-observations tests/fixtures/external-observations-valid.jsonl \
+  --external-as-of 2026-08-24T00:00:00Z
 ```
 
 The published archive was clean-room verified on August 24, 2026: 104 tests and 5 subtests passed, followed by a one-company live BRREG smoke run with one terminal envelope, five requests and zero silent drops.
+
+`tests/fixtures/` is described in `tests/fixtures/README.md`: every file there is synthetic.
+`docs/external-observations.md` documents the observation schema, the gate policy and the
+reproducible commands.
 
 Increase `--count` and `--expected-count` together for a larger local test. The 100-row smoke test above is practice only; Builderr supplies the companies for every official run.
 
