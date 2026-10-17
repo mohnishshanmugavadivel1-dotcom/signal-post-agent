@@ -57,6 +57,7 @@ from norway_company_agent.batch import (  # noqa: E402
     contract_envelope,
     evidence_terminal_state,
     profile_complete_for_modules,
+    public_citation_findings,
     read_organisation_inputs,
     terminal_envelope,
     validate_contract_envelope,
@@ -1706,6 +1707,73 @@ class OutputContractTests(unittest.TestCase):
 
         envelope = self.envelope(external_block={**block, "accepted_observation_ids": [], "rejected_observations": [{"id": "x", "reasons": [], "value": "leak"}]})
         self.assertIn("rejected observations may only carry id and reasons", validate_contract_envelope(envelope)["errors"])
+
+    def test_claims_cite_only_verifiable_evidence(self):
+        """Public citation rule: available claims always cite; other claims cite only captured bytes.
+
+        The organiser's public citation validator requires every cited evidence record to carry an
+        http(s) URL, a timezone-aware retrieval time and a 64-hex digest, and allows non-available
+        claims to cite nothing. A record produced before any bytes were captured therefore stays in
+        ``evidence[]`` (documenting the attempt) but is no longer cited by its claim.
+        """
+        profile = self.profile(evidence={
+            "registry": evidence("registry", "available", "official_registry_bulk", "https://data.brreg.no/x",
+                                 value={"navn": "AF GRUPPEN ASA"}, content_sha256="a" * 64),
+            # 404 with a captured body: verifiable, so the not_available claim keeps its citation
+            "financials": evidence("financials", "not_found", "official_registry_api", "https://data.brreg.no/y",
+                                   note="HTTP 404", content_sha256="b" * 64),
+            # no bytes captured: not verifiable, so the claims cite nothing
+            "group": evidence("group", "not_found", "official_registry_api", "https://data.brreg.no/z", note="HTTP 404"),
+            "website": evidence("website", "blocked", "registry_linked_company_website", "https://afgruppen.no/",
+                                note="robots.txt disallowed"),
+        })
+        envelope = contract_envelope(
+            profile, run_id="run-cite", modules=["registry", "financials", "group", "website", "roles"],
+            started_at="2026-08-24T00:00:00Z", completed_at="2026-08-24T00:00:05Z",
+        )
+        cited = {claim["field"]: claim["evidence_ids"] for claim in envelope["claims"]}
+        self.assertEqual(cited, {
+            "registry": ["ev-registry"], "financials": ["ev-financials"], "group": [], "website": [], "roles": [],
+        })
+        # one evidence record per module is still emitted, and errors[] still names the blocked module
+        self.assertEqual([record["id"] for record in envelope["evidence"]], [f"ev-{m}" for m in ("registry", "financials", "group", "website", "roles")])
+        self.assertEqual([item["module"] for item in envelope["errors"]], ["website"])
+        self.assertTrue(validate_contract_envelope(envelope)["passed"], validate_contract_envelope(envelope)["errors"])
+        self.assertEqual(public_citation_findings(envelope), [])
+
+    def test_validator_enforces_the_public_citation_rule(self):
+        envelope = self.envelope()  # registry available, financials not_available, website blocked (no digests)
+        self.assertEqual([claim["evidence_ids"] for claim in envelope["claims"]], [["ev-registry"], [], []])
+
+        broken = self.envelope()
+        broken["claims"][0]["evidence_ids"] = []
+        self.assertIn("claim registry must reference at least one evidence id", validate_contract_envelope(broken)["errors"])
+        self.assertIn("available claim registry cites no evidence", public_citation_findings(broken))
+
+        broken = self.envelope()
+        broken["claims"][1]["evidence_ids"] = ["ev-financials"]  # not_available claim pointing at uncaptured bytes
+        self.assertIn("claim financials cites evidence ev-financials that has no verifiable digest",
+                      validate_contract_envelope(broken)["errors"])
+        self.assertIn("claim financials cites evidence 'ev-financials' that is not verifiable (url/timestamp/digest)",
+                      public_citation_findings(broken))
+
+        broken = self.envelope()
+        broken["claims"][0]["evidence_ids"] = "ev-registry"
+        self.assertIn("claim registry evidence_ids must be a list", validate_contract_envelope(broken)["errors"])
+
+        for url in ("ftp://data.brreg.no/x", "https://user:pw@data.brreg.no/x", "data.brreg.no/x"):
+            with self.subTest(url=url):
+                tampered = self.envelope()
+                tampered["evidence"][0]["source_url"] = url
+                tampered["evidence"][0]["content_sha256"] = "a" * 64
+                self.assertEqual(len(public_citation_findings(tampered)), 1, url)
+        tampered = self.envelope()
+        tampered["evidence"][0]["content_sha256"] = "a" * 64
+        tampered["evidence"][0]["retrieved_at"] = "2026-08-24T00:00:00"  # no timezone
+        self.assertEqual(len(public_citation_findings(tampered)), 1)
+        tampered = self.envelope()
+        tampered["evidence"].append(dict(tampered["evidence"][0]))
+        self.assertIn("duplicate evidence id 'ev-registry'", public_citation_findings(tampered))
 
     def test_external_evidence_stays_out_of_official_claims_and_evidence(self):
         gate = gate_observations(

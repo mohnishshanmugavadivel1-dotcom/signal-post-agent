@@ -4,8 +4,10 @@ import hashlib
 import json
 import math
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 from .evidence import evidence, utc_now
 from .external_footprint import is_organisation_number, parse_timestamp
@@ -104,15 +106,100 @@ def _claim_span(module: str, record: dict[str, Any], profile: dict[str, Any]) ->
     return f"{module} evidence record"[:500]
 
 
+def _citable_source_url(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    parts = urlsplit(value.strip())
+    return parts.scheme in {"http", "https"} and bool(parts.netloc) and "@" not in parts.netloc
+
+
+def _citable_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def citable_evidence(record: dict[str, Any] | None) -> bool:
+    """True when a third party can verify the record from the envelope alone.
+
+    The organiser's public citation checks (``builderr-ai/signalpost-citation-validator``, which
+    states that its claim/evidence fields match the current public Signalpost output contract)
+    require every *cited* evidence record to carry an ``http(s)`` ``source_url`` without embedded
+    credentials, a timezone-aware ISO-8601 ``retrieved_at`` and a 64-hex ``content_sha256``. A record
+    produced before any bytes were captured (no registry website, robots refusal, transport error,
+    module never fetched) has no digest and therefore fails that check if a claim cites it.
+    """
+    if not isinstance(record, dict):
+        return False
+    digest = record.get("content_sha256")
+    return (
+        _citable_source_url(record.get("source_url"))
+        and _citable_timestamp(record.get("retrieved_at"))
+        and isinstance(digest, str)
+        and bool(_HASH_PATTERN.match(digest))
+    )
+
+
+def public_citation_findings(envelope: dict[str, Any]) -> list[str]:
+    """Apply the organiser's published envelope-level citation checks to one envelope.
+
+    Structure and reference integrity only — exactly the scope of the public validator: evidence
+    ids are unique; every ``available`` claim cites at least one evidence id; every cited id exists;
+    and every cited record is :func:`citable_evidence`. Claims in other availability states may cite
+    nothing. This does not judge whether a claim is true or belongs to the right company.
+    """
+    findings: list[str] = []
+    evidence_records = envelope.get("evidence")
+    claims = envelope.get("claims")
+    if not isinstance(evidence_records, list) or not isinstance(claims, list):
+        return ["claims and evidence must be lists"]
+    by_id: dict[Any, dict[str, Any]] = {}
+    for record in evidence_records:
+        if not isinstance(record, dict):
+            findings.append("evidence entries must be objects")
+            continue
+        if record.get("id") in by_id:
+            findings.append(f"duplicate evidence id {record.get('id')!r}")
+        by_id[record.get("id")] = record
+    for index, claim in enumerate(claims):
+        if not isinstance(claim, dict):
+            findings.append(f"claim #{index} must be an object")
+            continue
+        label = claim.get("field") if isinstance(claim.get("field"), str) else f"#{index}"
+        ids = claim.get("evidence_ids")
+        if not isinstance(ids, list):
+            findings.append(f"claim {label} evidence_ids must be a list")
+            continue
+        if claim.get("availability") == "available" and not ids:
+            findings.append(f"available claim {label} cites no evidence")
+        for evidence_id in ids:
+            record = by_id.get(evidence_id)
+            if record is None:
+                findings.append(f"claim {label} cites unknown evidence {evidence_id!r}")
+            elif not citable_evidence(record):
+                findings.append(f"claim {label} cites evidence {evidence_id!r} that is not verifiable (url/timestamp/digest)")
+    return findings
+
+
 def build_claims_and_evidence(
     profile: dict[str, Any],
     modules: Iterable[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Build the documented `claims` and `evidence` arrays from official evidence only.
 
-    One evidence record produces exactly one claim, so `claims` and `evidence` always have the
-    same length and every `evidence_ids` entry resolves inside the same envelope. External
+    One evidence record is emitted per requested module, so `claims` and `evidence` always have
+    the same length and every `evidence_ids` entry resolves inside the same envelope. External
     observations never enter this function; they travel in the separate `external` block.
+
+    Citation rule: an ``available`` claim always cites its evidence record. Any other claim cites
+    the record only when the record is :func:`citable_evidence` (captured bytes with a digest, an
+    http(s) URL and a timezone-aware retrieval time); otherwise ``evidence_ids`` is empty. The
+    record itself is still emitted — it documents the attempt and ``errors[]`` keeps the module,
+    state, note and URL — but no claim points a verifier at bytes that were never captured.
     """
     claims: list[dict[str, Any]] = []
     evidence_records: list[dict[str, Any]] = []
@@ -121,14 +208,16 @@ def build_claims_and_evidence(
         record = records.get(module)
         availability = availability_state(record)
         evidence_id = f"ev-{module}"
-        evidence_records.append({
+        evidence_record = {
             "id": evidence_id,
             "source_url": (record or {}).get("source_url"),
             "source_class": (record or {}).get("source_class") or (record or {}).get("source_type"),
             "retrieved_at": (record or {}).get("retrieved_at"),
             "content_sha256": (record or {}).get("content_sha256"),
             "claim_span": _claim_span(module, record or {}, profile),
-        })
+        }
+        evidence_records.append(evidence_record)
+        cited = availability == "available" or citable_evidence(evidence_record)
         claims.append({
             "field": module,
             # `confidence` here is a deterministic presence indicator (1.0 when the source returned
@@ -137,7 +226,7 @@ def build_claims_and_evidence(
             "value": (record or {}).get("value") if availability == "available" else None,
             "availability": availability,
             "confidence": 1.0 if availability == "available" else 0.0,
-            "evidence_ids": [evidence_id],
+            "evidence_ids": [evidence_id] if cited else [],
         })
     return claims, evidence_records
 
@@ -397,6 +486,7 @@ def validate_contract_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(evidence_records, list):
         errors.append("evidence must be a list")
     evidence_ids: list[str] = []
+    evidence_by_id: dict[str, dict[str, Any]] = {}
     if isinstance(evidence_records, list):
         for record in evidence_records:
             if not isinstance(record, dict):
@@ -417,6 +507,7 @@ def validate_contract_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
                 errors.append(f"evidence {record.get('id')} has a malformed content_sha256")
             if record.get("id") is not None:
                 evidence_ids.append(str(record["id"]))
+                evidence_by_id.setdefault(str(record["id"]), record)
     if len(evidence_ids) != len(set(evidence_ids)):
         errors.append("evidence ids must be unique within an envelope")
     claim_labels: list[str] = []
@@ -446,12 +537,23 @@ def validate_contract_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0.0 <= float(confidence) <= 1.0:
                 errors.append(f"claim {label} has an invalid confidence")
             ids = claim.get("evidence_ids")
-            if not isinstance(ids, list) or not ids:
+            if not isinstance(ids, list):
+                errors.append(f"claim {label} evidence_ids must be a list")
+            elif availability == "available" and not ids:
+                # The public citation checks require an available claim to cite evidence; claims in
+                # other availability states may cite nothing (OUTPUT_CONTRACT.md, implementation status).
                 errors.append(f"claim {label} must reference at least one evidence id")
             else:
                 for evidence_id in ids:
                     if str(evidence_id) not in evidence_ids:
                         errors.append(f"claim {label} references unknown evidence {evidence_id}")
+                    elif availability != "available" and not citable_evidence(evidence_by_id.get(str(evidence_id))):
+                        # A claim that did not obtain the source must not point a verifier at bytes
+                        # that were never captured. (Available records always carry a digest in this
+                        # pipeline; that invariant is enforced on producer output by
+                        # verify_competition_e2e's contract.citation_integrity check, so minimal
+                        # hand-built envelopes stay valid here.)
+                        errors.append(f"claim {label} cites evidence {evidence_id} that has no verifiable digest")
 
     operations = envelope["operations"]
     if not isinstance(operations, dict):

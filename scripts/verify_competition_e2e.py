@@ -45,7 +45,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from norway_company_agent.batch import validate_contract_envelope  # noqa: E402
+from norway_company_agent.batch import public_citation_findings, validate_contract_envelope  # noqa: E402
 
 ORGS_FIXTURE = Path("tests/fixtures/batch-orgs-3.jsonl")
 BULK_FIXTURE = Path("tests/fixtures/bulk-registry-sample.csv.gz")
@@ -164,6 +164,16 @@ def check_contract(findings: Findings, run_result: dict[str, Any]) -> None:
     required = {"contract_version", "organisation_number", "run", "claims", "evidence", "changes", "errors", "operations"}
     missing = [sorted(required - set(envelope)) for envelope in run_result["envelopes"]]
     findings.check("contract.required_fields", not any(missing), f"missing={missing}")
+    # The organiser's public citation checks (builderr-ai/signalpost-citation-validator): unique
+    # evidence ids, every available claim cites evidence, every cited record exists and carries an
+    # http(s) URL, a timezone-aware retrieval time and a 64-hex digest. Applied to real producer
+    # output, so the invariant "available records always carry a digest" is checked here as well.
+    citation_problems = [
+        f"{envelope.get('organisation_number')}: {problems[:3]}"
+        for envelope in run_result["envelopes"]
+        if (problems := public_citation_findings(envelope))
+    ]
+    findings.check("contract.citation_integrity", not citation_problems, "; ".join(citation_problems)[:600])
     operations = run_result["report"].get("operations", {})
     declared = [
         (envelope.get("operations") or {}).get("third_party_cost_usd")
