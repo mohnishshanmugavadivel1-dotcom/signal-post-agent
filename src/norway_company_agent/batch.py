@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Iterable
@@ -466,7 +467,12 @@ def validate_contract_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(runtime, int) or isinstance(runtime, bool) or runtime < 0:
             errors.append("operations.runtime_ms must be a non-negative integer")
         cost = operations.get("third_party_cost_usd")
-        if not isinstance(cost, (int, float)) or isinstance(cost, bool) or float(cost) < 0:
+        if (
+            not isinstance(cost, (int, float))
+            or isinstance(cost, bool)
+            or not math.isfinite(float(cost))
+            or float(cost) < 0
+        ):
             errors.append("operations.third_party_cost_usd must be a non-negative number")
 
     for key in ("changes", "errors", "modules"):

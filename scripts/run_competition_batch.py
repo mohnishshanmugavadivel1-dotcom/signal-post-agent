@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -76,6 +77,39 @@ def load_external_gate(args, orgs: list[str]) -> tuple[dict | None, dict | None]
         for org in sorted(gate["by_organisation"])
     }
     return gate, summary
+
+
+def aggregate_third_party_cost(envelopes: list[dict]) -> dict:
+    """Sum the ``operations.third_party_cost_usd`` each envelope declares.
+
+    The envelope is the contract boundary, so its declaration is the authoritative per-company
+    figure. A partial total is never reported: when any envelope carries no usable cost the
+    aggregate is ``None`` and the report says so, rather than presenting a partial sum as if it
+    were the run total.
+    """
+    total = 0.0
+    unavailable = 0
+    for envelope in envelopes:
+        operations = envelope.get("operations") if isinstance(envelope, dict) else None
+        value = operations.get("third_party_cost_usd") if isinstance(operations, dict) else None
+        usable = (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) >= 0
+        )
+        if not usable:
+            unavailable += 1
+            continue
+        total += float(value)
+    aggregate = {
+        "third_party_cost_usd": None if unavailable else round(total, 6),
+        "third_party_cost_usd_complete": unavailable == 0,
+        "third_party_cost_usd_basis": "sum of the third_party_cost_usd declared by each emitted envelope",
+    }
+    if unavailable:
+        aggregate["third_party_cost_usd_unavailable_envelopes"] = unavailable
+    return aggregate
 
 
 def main() -> None:
@@ -226,6 +260,7 @@ def main() -> None:
     }
     write_jsonl(profiles_output, ordered_profiles)
     write_jsonl(Path(args.output), envelopes)
+    operations.update(aggregate_third_party_cost(envelopes))
     latencies = sorted(operations.pop("latencies_ms"))
     operations["p50_ms"] = latencies[len(latencies) // 2] if latencies else None
     operations["p95_ms"] = latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] if latencies else None

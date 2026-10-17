@@ -164,6 +164,22 @@ def check_contract(findings: Findings, run_result: dict[str, Any]) -> None:
     required = {"contract_version", "organisation_number", "run", "claims", "evidence", "changes", "errors", "operations"}
     missing = [sorted(required - set(envelope)) for envelope in run_result["envelopes"]]
     findings.check("contract.required_fields", not any(missing), f"missing={missing}")
+    operations = run_result["report"].get("operations", {})
+    declared = [
+        (envelope.get("operations") or {}).get("third_party_cost_usd")
+        for envelope in run_result["envelopes"]
+    ]
+    expected_cost = round(
+        sum(value for value in declared if isinstance(value, (int, float)) and not isinstance(value, bool)),
+        6,
+    )
+    findings.check(
+        "report.third_party_cost_aggregate",
+        operations.get("third_party_cost_usd") == expected_cost
+        and operations.get("third_party_cost_usd_complete") is True
+        and bool(operations.get("third_party_cost_usd_basis")),
+        json.dumps({"report_operations": operations, "envelope_costs": declared}),
+    )
 
 
 def check_acceptance_and_rejection(findings: Findings, run_result: dict[str, Any]) -> dict[str, dict[str, Any]]:

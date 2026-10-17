@@ -72,6 +72,7 @@ from scripts.run_scrapy_websites import terminal_events_for_run  # noqa: E402
 from scripts.run_sentiment_model import MODEL_REVISION, normalize_generated_label  # noqa: E402
 from scripts.score_company_completeness import score_rows, summarize  # noqa: E402
 from scripts.score_competition_v3 import capped, numeric  # noqa: E402
+from scripts.run_competition_batch import aggregate_third_party_cost  # noqa: E402
 from scripts.extract_company_site_activity import observation as site_activity_observation  # noqa: E402
 from scripts.extract_company_site_news import observation as site_news_observation  # noqa: E402
 from scripts.build_verified_observations import build as build_verified_observations  # noqa: E402
@@ -1611,6 +1612,20 @@ class OutputContractTests(unittest.TestCase):
         self.assertEqual(envelope["state"], "complete")
         self.assertEqual(envelope["run_id"], "run-1")
 
+    def test_missing_third_party_cost_is_a_contract_error(self):
+        envelope = self.envelope()
+        del envelope["operations"]["third_party_cost_usd"]
+        self.assertIn("operations is missing third_party_cost_usd",
+                      validate_contract_envelope(envelope)["errors"])
+
+    def test_invalid_third_party_cost_is_a_contract_error(self):
+        for value in ("1.50", -0.01, True, float("nan"), float("inf")):
+            with self.subTest(value=repr(value)):
+                envelope = self.envelope()
+                envelope["operations"]["third_party_cost_usd"] = value
+                self.assertIn("operations.third_party_cost_usd must be a non-negative number",
+                              validate_contract_envelope(envelope)["errors"])
+
     def test_availability_vocabulary_is_documented_and_exhaustive(self):
         self.assertTrue(set(EVIDENCE_STATUS_TO_AVAILABILITY.values()) <= AVAILABILITY_STATES)
         self.assertEqual(EVIDENCE_STATUS_TO_AVAILABILITY["not_fetched"], "not_available")
@@ -2708,6 +2723,52 @@ class AuditCliIntegrityTests(unittest.TestCase):
         self.assertEqual(report["external_report_mismatches"], [])
         self.assertTrue(report["qualification_gates"]["external_audit_at_least_100"])
         self.assertEqual(report["measurement_source"], "derived_from_artifacts")
+
+
+class RunReportCostTests(unittest.TestCase):
+    """The run report must aggregate envelope-declared third-party cost, never guess it."""
+
+    @staticmethod
+    def envelope(cost):
+        operations = {"requests": 1, "runtime_ms": 5}
+        if cost is not ...:
+            operations["third_party_cost_usd"] = cost
+        return {"organisation_number": "923609016", "operations": operations}
+
+    def test_aggregate_sums_nonzero_envelope_costs(self):
+        report = aggregate_third_party_cost([
+            self.envelope(0.5), self.envelope(1.25), self.envelope(0.0),
+        ])
+        self.assertEqual(report["third_party_cost_usd"], 1.75)
+        self.assertIs(report["third_party_cost_usd_complete"], True)
+        self.assertNotIn("third_party_cost_usd_unavailable_envelopes", report)
+        self.assertIn("sum of", report["third_party_cost_usd_basis"])
+
+    def test_aggregate_rounds_floating_point_noise(self):
+        report = aggregate_third_party_cost([self.envelope(0.1), self.envelope(0.2)])
+        self.assertEqual(report["third_party_cost_usd"], 0.3)
+
+    def test_missing_or_invalid_cost_never_yields_a_partial_total(self):
+        envelopes = [
+            self.envelope(2.0),
+            self.envelope(...),          # cost key absent
+            {"organisation_number": "1", "operations": "not-an-object"},
+            {"organisation_number": "2"},
+            self.envelope("1.50"),       # wrong type
+            self.envelope(True),         # bool is not a cost
+            self.envelope(-0.01),        # negative
+            self.envelope(float("nan")),
+            self.envelope(float("inf")),
+        ]
+        report = aggregate_third_party_cost(envelopes)
+        self.assertIsNone(report["third_party_cost_usd"])
+        self.assertIs(report["third_party_cost_usd_complete"], False)
+        self.assertEqual(report["third_party_cost_usd_unavailable_envelopes"], 8)
+
+    def test_empty_run_is_a_complete_zero(self):
+        report = aggregate_third_party_cost([])
+        self.assertEqual(report["third_party_cost_usd"], 0.0)
+        self.assertIs(report["third_party_cost_usd_complete"], True)
 
 
 if __name__ == "__main__":

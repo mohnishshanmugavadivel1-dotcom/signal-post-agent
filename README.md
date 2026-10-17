@@ -68,6 +68,12 @@ uv run python scripts/run_competition_batch.py \
   --run-id smoke-001 \
   --expected-count 100
 
+The run report's `operations` block records total requests, p50/p95 runtime and the summed
+`third_party_cost_usd` declared by the emitted envelopes (`third_party_cost_usd_basis` names that
+basis). If any envelope has no usable cost, `third_party_cost_usd` is `null`,
+`third_party_cost_usd_complete` is `false` and `third_party_cost_usd_unavailable_envelopes` counts
+them — an incomplete accounting is reported, never replaced by a partial sum.
+
 # You may test at larger scale locally, but Builderr supplies the official batch for scoring.
 uv run python scripts/run_competition_batch.py \
   --organisations entry-companies.jsonl \
