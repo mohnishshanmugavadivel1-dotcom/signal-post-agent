@@ -2839,5 +2839,78 @@ class RunReportCostTests(unittest.TestCase):
         self.assertIs(report["third_party_cost_usd_complete"], True)
 
 
+class SmokeArtifactVerifierTests(unittest.TestCase):
+    """scripts/verify_smoke_artifacts.py accepts a genuine CLI run and rejects tampered artefacts.
+
+    Runs the real batch CLI offline (synthetic fixtures, official-only modules that need no network)
+    purely to obtain artefacts of the right shape; this is a mechanics test of the verifier, not a
+    smoke-test result.
+    """
+
+    FIXTURES = ROOT / "tests" / "fixtures"
+
+    def verify(self, report, envelopes, *, expected=3, extra=()):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "verify_smoke_artifacts.py"),
+             "--report", str(report), "--envelopes", str(envelopes),
+             "--organisations", str(self.FIXTURES / "batch-orgs-3.jsonl"), "--expected-count", str(expected), *extra],
+            cwd=ROOT, capture_output=True, text=True, timeout=180,
+        )
+
+    def test_verifier_accepts_a_real_run_and_rejects_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            report, envelopes = workdir / "report.json", workdir / "envelopes.jsonl"
+            run = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "run_competition_batch.py"),
+                 "--organisations", str(self.FIXTURES / "batch-orgs-3.jsonl"),
+                 "--bulk", str(self.FIXTURES / "bulk-registry-sample.csv.gz"),
+                 "--profiles-output", str(workdir / "profiles.jsonl"), "--output", str(envelopes),
+                 "--report", str(report), "--run-id", "verifier-001", "--expected-count", "3",
+                 "--modules", "registry,accounting_obligation,website"],
+                cwd=ROOT, capture_output=True, text=True, timeout=180,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr[-400:])
+
+            accepted = self.verify(report, envelopes, extra=["--run-id", "verifier-001", "--json-output", str(workdir / "summary.json")])
+            self.assertEqual(accepted.returncode, 0, accepted.stdout[-800:])
+            summary = json.loads((workdir / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["passed"])
+            self.assertTrue(all(item["passed"] for item in summary["checks"]))
+            self.assertIn("envelopes.public_citation_checks", {item["check"] for item in summary["checks"]})
+
+            self.assertEqual(self.verify(report, envelopes, extra=["--run-id", "other"]).returncode, 1)
+            self.assertEqual(self.verify(report, envelopes, expected=100).returncode, 1)
+
+            body = json.loads(report.read_text(encoding="utf-8"))
+            rows = [json.loads(line) for line in envelopes.read_text(encoding="utf-8").splitlines() if line.strip()]
+            cases = {}
+            wrong_count = dict(body, emitted_envelopes=2)
+            cases["report.emitted_envelopes"] = (wrong_count, rows)
+            wrong_cost = json.loads(json.dumps(body))
+            wrong_cost["operations"]["third_party_cost_usd"] = 0.25
+            cases["report.cost_aggregate"] = (wrong_cost, rows)
+            duplicate = json.loads(json.dumps(rows))
+            duplicate[1]["organisation_number"] = duplicate[0]["organisation_number"]
+            cases["envelopes.unique_organisations"] = (body, duplicate)
+            cited_without_bytes = json.loads(json.dumps(rows))
+            website = next(claim for claim in cited_without_bytes[0]["claims"] if claim["field"] == "website")
+            self.assertNotEqual(website["availability"], "available")
+            website["evidence_ids"] = ["ev-website"]
+            cases["envelopes.public_citation_checks"] = (body, cited_without_bytes)
+            leaked = json.loads(json.dumps(rows))
+            leaked[0]["profile"]["note"] = "Authorization: Bearer abc"
+            cases["artifacts.no_credential_strings"] = (body, leaked)
+            for expected_failure, (tampered_report, tampered_rows) in cases.items():
+                with self.subTest(check=expected_failure):
+                    case_dir = workdir / expected_failure
+                    case_dir.mkdir()
+                    (case_dir / "report.json").write_text(json.dumps(tampered_report), encoding="utf-8")
+                    (case_dir / "envelopes.jsonl").write_text("".join(json.dumps(row) + "\n" for row in tampered_rows), encoding="utf-8")
+                    result = self.verify(case_dir / "report.json", case_dir / "envelopes.jsonl")
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(f"[FAIL] {expected_failure}", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -49,6 +49,7 @@ The manifest selector can create a local test batch of any size. Use 100 rows fo
 ```bash
 uv sync
 curl -L 'https://data.brreg.no/enhetsregisteret/api/enheter/lastned/csv' -o brreg-enheter.csv
+gzip -t brreg-enheter.csv   # the registry download is gzip-compressed and the loader expects gzip bytes
 curl -L 'https://builderr.ai/signalpost-company-universe-2025.jsonl.gz' -o signalpost-universe.jsonl.gz
 
 uv run python select_entry_batch.py \
@@ -68,12 +69,32 @@ uv run python scripts/run_competition_batch.py \
   --run-id smoke-001 \
   --expected-count 100
 
+# Check the run before publishing it (counts, contract, citations, cost aggregate, secrets):
+uv run python scripts/verify_smoke_artifacts.py \
+  --report out/smoke-report.json \
+  --envelopes out/smoke-envelopes.jsonl \
+  --organisations smoke-companies.jsonl \
+  --expected-count 100
+```
+
 The run report's `operations` block records total requests, p50/p95 runtime and the summed
 `third_party_cost_usd` declared by the emitted envelopes (`third_party_cost_usd_basis` names that
 basis). If any envelope has no usable cost, `third_party_cost_usd` is `null`,
 `third_party_cost_usd_complete` is `false` and `third_party_cost_usd_unavailable_envelopes` counts
 them — an incomplete accounting is reported, never replaced by a partial sum.
 
+Cost basis (verified against the execution path, 2026-10-17): the batch runner does not meter
+spend. Each envelope's `third_party_cost_usd` is the declaration made by `contract_envelope()`, which
+defaults to `0.0` because the default modules call only unmetered sources — the local Brreg bulk
+snapshot, the open `data.brreg.no` APIs (no key or account) and the company's own registry-listed
+website; no credential is read anywhere in `src/`. The optional Brave Search discovery script
+(`scripts/run_brave_discovery.py`, requires `BRAVE_SEARCH_API_KEY`) is a separate metered step
+outside this command. A run that adds a paid connector must pass its cost into
+`contract_envelope(third_party_cost_usd=...)`; otherwise the report understates spend.
+
+`artifacts/README.md` describes where a real smoke-test report is tracked and how it is verified.
+
+```bash
 # You may test at larger scale locally, but Builderr supplies the official batch for scoring.
 uv run python scripts/run_competition_batch.py \
   --organisations entry-companies.jsonl \
