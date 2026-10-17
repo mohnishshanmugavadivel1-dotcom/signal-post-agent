@@ -4,8 +4,14 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from norway_company_agent.external_pipeline import gate_observations, read_observation_file  # noqa: E402
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -285,16 +291,30 @@ if __name__ == "__main__":
     if args.limit:
         rows = rows[:args.limit]
     external_by_org: dict[str, list[dict]] = defaultdict(list)
-    seen_observations: set[str] = set()
-    for source in args.external_observations or []:
-        for observation in read_jsonl(Path(source)):
-            observation_id = str(observation.get("id") or json.dumps(observation, sort_keys=True, ensure_ascii=False))
-            if observation_id in seen_observations:
-                continue
-            seen_observations.add(observation_id)
-            organisation_number = str(observation.get("organisation_number") or "")
-            if organisation_number:
-                external_by_org[organisation_number].append(observation)
+    if args.external_observations:
+        # The laboratory view renders publishable evidence only: every record passes the same
+        # identity/rights/duplicate/hash gate as the competition pipeline, bound to the organisations
+        # in this batch. Rejected and unmatched records are counted, never rendered.
+        records: list[dict] = []
+        malformed: list[dict] = []
+        for source in args.external_observations:
+            file_records, file_malformed = read_observation_file(source)
+            records.extend(file_records)
+            malformed.extend(file_malformed)
+        gate = gate_observations(
+            records,
+            organisation_numbers=[str(row["organisation_number"]) for row in rows],
+            malformed=malformed,
+        )
+        for observation in gate["accepted"]:
+            external_by_org[str(observation["organisation_number"])].append(observation)
+        print(
+            "External observations: "
+            f"{len(gate['accepted'])} accepted, {len(gate['rejected'])} rejected, "
+            f"{len(gate['unmatched'])} unmatched, {len(gate['malformed'])} malformed "
+            f"(collapsed {gate['duplicates']['collapsed_identical']} duplicate(s), "
+            f"{len(gate['duplicates']['conflicting_groups'])} conflicting group(s))"
+        )
     score = json.loads(Path(args.score).read_text(encoding="utf-8")) if args.score and Path(args.score).exists() else None
     control_loop = json.loads(Path(args.control_loop).read_text(encoding="utf-8")) if args.control_loop and Path(args.control_loop).exists() else None
     independent_score = json.loads(Path(args.independent_score).read_text(encoding="utf-8")) if args.independent_score and Path(args.independent_score).exists() else None
