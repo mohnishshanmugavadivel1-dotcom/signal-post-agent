@@ -7,6 +7,28 @@ from typing import Any, Callable
 from .evidence import evidence
 from .http import FetchResult, fetch_json
 
+def parse_employee_count(value: Any) -> int | None:
+    """Parse and validate employee count. Only non-negative integers are valid."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if value.is_integer() and value >= 0:
+            return int(value)
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        if s.isdigit():
+            return int(s)
+        return None
+    return None
+
+
 ACCOUNTING_OBLIGATION_SOURCE = "https://www.brreg.no/en/submission-of-annual-accounts/reporting-obligations-to-the-register-of-company-accounts/who-has-an-accounting-obligation/"
 ACCOUNTING_RULESET_VERSION = "brreg_accounting_obligation_rules_2024-08-09_v1"
 ALWAYS_ACCOUNTING_OBLIGED_FORMS = {"AS", "ASA", "BRL", "BBL", "STI", "SF", "VPFO"}
@@ -159,7 +181,7 @@ def normalize_entity(body: Any) -> dict[str, Any]:
         "organisation_number": body.get("organisasjonsnummer"),
         "name": body.get("navn"),
         "legal_form": _get(body, "organisasjonsform", "kode"),
-        "employees": body.get("antallAnsatte"),
+        "employees": parse_employee_count(body.get("antallAnsatte")),
         "bankrupt": body.get("konkurs"),
         "liquidating": body.get("underAvvikling"),
         "website": body.get("hjemmeside"),
@@ -196,6 +218,76 @@ def fetch_official_modules(org: str, modules: set[str], fetcher: Callable[[str],
         metrics.append(result)
         normalized = None
         if result.status == 200:
-            normalized = normalize_entity(result.body) if module == "registry_live" else normalize_financials(result.body) if module == "financials" else normalize_financial_history(result.body, org) if module == "financial_history" else normalize_roles(result.body) if module == "roles" else normalize_locations(result.body) if module == "locations" else result.body
+            if module == "registry_live":
+                resp_body = result.body if isinstance(result.body, dict) else {}
+                resp_org = resp_body.get("organisasjonsnummer")
+                norm_req = str(org).strip()
+                norm_resp = str(resp_org).strip() if resp_org is not None else ""
+                if not (norm_resp.isdigit() and len(norm_resp) == 9 and norm_resp == norm_req):
+                    note = f"Organisation number mismatch: requested {norm_req}, received {resp_org}"
+                    records[module] = evidence(
+                        module,
+                        "source_error",
+                        source_type,
+                        result.url,
+                        note=note,
+                        content_sha256=result.content_sha256,
+                        retrieved_at=result.retrieved_at,
+                        effective_at=result.effective_at,
+                    )
+                    continue
+                normalized = normalize_entity(result.body)
+            else:
+                normalized = normalize_financials(result.body) if module == "financials" else normalize_financial_history(result.body, org) if module == "financial_history" else normalize_roles(result.body) if module == "roles" else normalize_locations(result.body) if module == "locations" else result.body
         records[module] = _classified(module, source_type, result, value=normalized)
     return records, metrics
+
+def validate_revenue_comparison(current: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
+    """Validate that two financial records are strictly comparable for revenue changes."""
+    import datetime
+    if not isinstance(current, dict) or not isinstance(previous, dict):
+        return {"compatible": False, "reason": "Both financial records must be dictionaries."}
+
+    # Scope check
+    type_curr = current.get("account_type")
+    type_prev = previous.get("account_type")
+    if not type_curr or not type_prev:
+        return {"compatible": False, "reason": "Missing account_type on one or both records."}
+    if type_curr != type_prev:
+        return {"compatible": False, "reason": f"Incompatible accounting scope: {type_curr} vs {type_prev}."}
+
+    # Currency check
+    curr_curr = current.get("currency")
+    curr_prev = previous.get("currency")
+    if not curr_curr or not curr_prev:
+        return {"compatible": False, "reason": "Missing currency on one or both records."}
+    if curr_curr != curr_prev:
+        return {"compatible": False, "reason": f"Incompatible currency: {curr_curr} vs {curr_prev}."}
+
+    # Period check
+    per_curr = current.get("period")
+    per_prev = previous.get("period")
+    if not isinstance(per_curr, dict) or not isinstance(per_prev, dict):
+        return {"compatible": False, "reason": "Missing or invalid period on one or both records."}
+
+    try:
+        c_start = datetime.date.fromisoformat(per_curr["fraOgMed"])
+        c_end = datetime.date.fromisoformat(per_curr["tilOgMed"])
+        p_start = datetime.date.fromisoformat(per_prev["fraOgMed"])
+        p_end = datetime.date.fromisoformat(per_prev["tilOgMed"])
+    except (KeyError, ValueError, TypeError) as e:
+        return {"compatible": False, "reason": f"Invalid period date format: {e}."}
+
+    # Check 12-month duration (approx 350-375 days)
+    c_days = (c_end - c_start).days + 1
+    p_days = (p_end - p_start).days + 1
+    if not (350 <= c_days <= 375):
+        return {"compatible": False, "reason": f"Current period is not a 12-month period ({c_days} days)."}
+    if not (350 <= p_days <= 375):
+        return {"compatible": False, "reason": f"Previous period is not a 12-month period ({p_days} days)."}
+
+    # Check chronological ordering: current period must be strictly after previous period
+    if c_start < p_end:
+        return {"compatible": False, "reason": f"Wrong chronological ordering: current starts ({c_start}) before previous ends ({p_end})."}
+
+    return {"compatible": True, "reason": None}
