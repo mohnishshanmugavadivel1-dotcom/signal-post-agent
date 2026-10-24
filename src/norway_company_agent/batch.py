@@ -207,6 +207,12 @@ def build_claims_and_evidence(
     for module in modules:
         record = records.get(module)
         availability = availability_state(record)
+        if module == "website" and availability == "available":
+            val = (record or {}).get("value") or {}
+            assessment = val.get("identity_assessment")
+            is_publishable = bool(isinstance(assessment, dict) and assessment.get("publishable") is True)
+            if not is_publishable:
+                availability = "not_available"
         evidence_id = f"ev-{module}"
         evidence_record = {
             "id": evidence_id,
@@ -238,6 +244,12 @@ def build_errors(profile: dict[str, Any], modules: Iterable[str]) -> list[dict[s
     for module in modules:
         record = records.get(module)
         availability = availability_state(record)
+        if module == "website" and availability == "available":
+            val = (record or {}).get("value") or {}
+            assessment = val.get("identity_assessment")
+            is_publishable = bool(isinstance(assessment, dict) and assessment.get("publishable") is True)
+            if not is_publishable:
+                availability = "not_available"
         if availability in {"available", "not_available", "not_applicable"}:
             continue
         errors.append({

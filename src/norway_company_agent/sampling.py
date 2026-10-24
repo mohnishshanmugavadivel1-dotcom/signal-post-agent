@@ -10,6 +10,48 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
+def parse_status_bool(val: Any) -> bool | None:
+    """Parse boolean status flag from registry row.
+    Returns:
+      True for confirmed true ('true', 'j', 'ja', 'yes', '1', True)
+      False for confirmed false ('false', 'n', 'nei', 'no', '0', False)
+      None if missing, empty, whitespace, or unrecognized/malformed.
+    """
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().casefold()
+    if not s:
+        return None
+    if s in {"true", "j", "ja", "yes", "1"}:
+        return True
+    if s in {"false", "n", "nei", "no", "0"}:
+        return False
+    return None
+
+
+def parse_employee_count(value: Any) -> int | None:
+    """Parse and validate employee count. Only non-negative integers are valid."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if value.is_integer() and value >= 0:
+            return int(value)
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        if s.isdigit():
+            return int(s)
+        return None
+    return None
+
 
 def _first(row: dict[str, str], *names: str) -> str:
     for name in names:
@@ -22,17 +64,24 @@ def _first(row: dict[str, str], *names: str) -> str:
 def normalize_row(row: dict[str, str]) -> dict[str, Any]:
     org = _first(row, "organisasjonsnummer", "Organisasjonsnummer")
     employees_raw = _first(row, "antallAnsatte", "Antall ansatte")
-    try:
-        employees = int(employees_raw) if employees_raw else None
-    except ValueError:
-        employees = None
+    employees = parse_employee_count(employees_raw)
+    bankrupt_flag = parse_status_bool(_first(row, "konkurs", "Konkurs"))
+    liquidating_flag = parse_status_bool(_first(row, "underAvvikling", "Under avvikling"))
+    forced_flag = parse_status_bool(_first(row, "underTvangsavvikling", "Under tvangsavvikling"))
+    raw_slette = _first(row, "slettedato", "Slettedato")
+    deleted = bool(raw_slette)
+    slettedato_val = raw_slette.strip() if raw_slette else ""
+
     return {
         "organisation_number": org,
         "name": _first(row, "navn", "Navn"),
         "legal_form": _first(row, "organisasjonsform.kode", "Organisasjonsform.kode"),
         "employees": employees,
-        "bankrupt": _first(row, "konkurs", "Konkurs").lower() == "true",
-        "liquidating": _first(row, "underAvvikling", "Under avvikling").lower() == "true",
+        "bankrupt": bankrupt_flag,
+        "liquidating": liquidating_flag,
+        "deleted": deleted,
+        "forced_dissolution": forced_flag,
+        "slettedato": slettedato_val,
         "municipality": _first(row, "forretningsadresse.kommune", "Forretningsadresse.kommune"),
         "municipality_number": _first(row, "forretningsadresse.kommunenummer", "Forretningsadresse.kommunenummer"),
         "industry_code": _first(row, "naeringskode1.kode", "Næringskode1.kode"),
@@ -45,10 +94,21 @@ def normalize_row(row: dict[str, str]) -> dict[str, Any]:
 
 def stratum(record: dict[str, Any]) -> str:
     form = record["legal_form"] if record["legal_form"] in {"AS", "ASA", "ENK"} else "OTHER"
-    employees = record["employees"]
+    employees = parse_employee_count(record.get("employees"))
     employee_band = "missing" if employees is None else "0" if employees == 0 else "1-4" if employees < 5 else "5-19" if employees < 20 else "20-99" if employees < 100 else "100+"
-    state = "adverse" if record["bankrupt"] or record["liquidating"] else "active"
-    web = "web" if record["website"] else "no-web"
+    b = record.get("bankrupt")
+    l = record.get("liquidating")
+    f = record.get("forced_dissolution")
+    d = record.get("deleted")
+
+    if b is True or l is True or f is True or d is True:
+        state = "adverse"
+    elif b is False and l is False and f is not True and not d:
+        state = "active"
+    else:
+        state = "unknown"
+
+    web = "web" if record.get("website") else "no-web"
     return "|".join([form, employee_band, state, web])
 
 
@@ -56,8 +116,14 @@ def financial_filer_eligible(record: dict[str, Any], latest_year: str, *, active
     """Return whether a registry row belongs to the frozen financial-filer universe."""
     if str(record.get("latest_submitted_accounts") or "") != str(latest_year):
         return False
-    if active_only and (record.get("bankrupt") or record.get("liquidating")):
-        return False
+    if active_only:
+        b = record.get("bankrupt")
+        l = record.get("liquidating")
+        f = record.get("forced_dissolution")
+        d = record.get("deleted")
+        # Explicit conservative policy: row must be confirmed active (no adverse flags, not unknown)
+        if not (b is False and l is False and f is not True and not d):
+            return False
     return True
 
 

@@ -3,6 +3,27 @@ from __future__ import annotations
 import re
 from typing import Any
 
+def parse_employee_count(value: Any) -> int | None:
+    """Parse and validate employee count. Only non-negative integers are valid."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if value.is_integer() and value >= 0:
+            return int(value)
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        if s.isdigit():
+            return int(s)
+        return None
+    return None
+
 
 def _claim(label: str, value: Any, record: dict[str, Any], classification: str) -> dict[str, Any]:
     return {
@@ -35,6 +56,11 @@ def answer_profile(row: dict[str, Any], question: str) -> dict[str, Any]:
             ("Registry employee count", row.get("employees")),
         ):
             if value not in (None, ""):
+                if label == "Registry employee count":
+                    parsed_emp = parse_employee_count(value)
+                    if parsed_emp is None:
+                        continue
+                    value = parsed_emp
                 facts.append(_claim(label, value, registry, "official_registry_fact"))
 
     financial = evidence.get("financials", {})
@@ -74,7 +100,8 @@ def answer_profile(row: dict[str, Any], question: str) -> dict[str, Any]:
     website = evidence.get("website", {})
     if all_topics or "social" in q:
         value = website.get("value") or {}
-        website_publishable = (value.get("identity_assessment") or {}).get("publishable", True)
+        assessment = value.get("identity_assessment")
+        website_publishable = bool(isinstance(assessment, dict) and assessment.get("publishable") is True)
         if value.get("description") and website_publishable:
             facts.append(_claim("Website description", value["description"], website, "company_reported_claim"))
         for item in (value.get("social_links") or []) if website_publishable else []:
@@ -193,8 +220,10 @@ def _compare(actual: Any, operator: str, expected: Any) -> bool:
 
 
 def _screen_value(row: dict[str, Any], field: str) -> Any:
-    if field in {"municipality", "legal_form", "employees"}:
+    if field in {"municipality", "legal_form"}:
         return row.get(field)
+    if field == "employees":
+        return parse_employee_count(row.get(field))
     if field in {"revenue", "annual_result"}:
         return _latest_financial(row).get(field)
     if field == "website":
